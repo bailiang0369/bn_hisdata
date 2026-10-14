@@ -16,10 +16,14 @@
 
 本地布局：
 ```
-data/{date}/{exchange}/{HH}/BTCUSDT_orderbook.parquet[.zst]   # 原始（按小时分存）
-data/{date}/{exchange}_minute_band.parquet                   # 处理后（按天合并）
-data/{date}/{exchange}_minute_band_mid.parquet
+orderbook/data/{date}/{exchange}/{HH}/BTCUSDT_orderbook.parquet[.zst]   # 原始（按小时分存）
+orderbook/data/{date}/{exchange}_minute_band.parquet                   # 处理后（按天合并）
+orderbook/data/{date}/{exchange}_minute_band_mid.parquet
 ```
+
+> 本仓库的订单簿相关代码都放在 `orderbook/` 目录下。从**仓库根目录**运行，例如
+> `python orderbook/pipeline.py --date 2026-10-12`；数据默认落在 `orderbook/data/`。
+> （与 `data.binance.vision` 的 K 线 / aggTrades / metrics 处理逻辑完全不同，后续会放在独立的模块目录，互不影响。）
 
 ---
 

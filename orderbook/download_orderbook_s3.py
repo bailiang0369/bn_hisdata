@@ -30,6 +30,7 @@ import requests
 
 from s3lite import S3LiteClient, S3LiteError
 
+HERE = Path(__file__).resolve().parent
 API_BASE = "https://api.cryptohftdata.com/v1"
 EXCHANGES = ["binance_spot", "binance_futures"]
 SYMBOL = "BTCUSDT"
@@ -105,7 +106,8 @@ def _write_payload(body, dest: Path, decompress: bool) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", required=True, help="UTC date YYYY-MM-DD")
-    ap.add_argument("--dest-root", default="data", help="Local output root (default: data)")
+    ap.add_argument("--dest-root", default=str(HERE / "data"),
+                    help="Local output root (default: <module>/data)")
     ap.add_argument("--workers", type=int, default=32, help="Concurrent downloads (default 32)")
     ap.add_argument("--hours", type=int, nargs="+", default=None,
                    help="Hours to download, e.g. 0 1 2 (default: all 0-23)")

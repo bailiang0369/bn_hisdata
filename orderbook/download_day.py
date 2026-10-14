@@ -11,6 +11,7 @@ from pathlib import Path
 
 import requests
 
+HERE = Path(__file__).resolve().parent
 API_BASE = "https://api.cryptohftdata.com/v1"
 SYMBOL = "BTCUSDT"
 DATA_TYPE = "orderbook"
@@ -48,7 +49,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", required=True, help="UTC date YYYY-MM-DD")
     ap.add_argument("--exchange", default="binance_futures")
-    ap.add_argument("--dest-root", default="data")
+    ap.add_argument("--dest-root", default=str(HERE / "data"))
     ap.add_argument("--sleep", type=float, default=1.5)
     args = ap.parse_args()
 

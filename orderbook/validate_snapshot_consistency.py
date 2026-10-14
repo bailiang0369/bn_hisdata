@@ -20,6 +20,8 @@ import polars as pl
 
 from ob_reconstruct import reconstruct_state
 
+HERE = Path(__file__).resolve().parent
+
 
 def reconstruct_last_minute(path: Path):
     df = pl.read_parquet(path).select(
@@ -78,9 +80,10 @@ def main() -> None:
     ap.add_argument("--date", required=True)
     ap.add_argument("--exchange", default="binance_spot")
     ap.add_argument("--band", type=float, default=0.003)
+    ap.add_argument("--dest-root", default=str(HERE / "data"))
     args = ap.parse_args()
 
-    root = Path(f"data/{args.date}/{args.exchange}")
+    root = Path(args.dest_root) / args.date / args.exchange
     files = sorted(root.glob("*/BTCUSDT_orderbook.parquet"))
     n = len(files) - 1  # boundaries H=0..n-1 vs H+1 snapshot
 

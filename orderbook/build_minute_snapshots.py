@@ -24,6 +24,7 @@ import polars as pl
 
 from ob_reconstruct import reconstruct_state, reconstruct_state_sparse
 
+HERE = Path(__file__).resolve().parent
 START = time.time()
 
 
@@ -69,10 +70,11 @@ def main() -> None:
     ap.add_argument("--exchange", default="binance_spot")
     ap.add_argument("--band", type=float, default=0.003)
     ap.add_argument("--mode", choices=["dense", "sparse"], default="dense")
+    ap.add_argument("--dest-root", default=str(HERE / "data"))
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    root = Path(f"data/{args.date}/{args.exchange}")
+    root = Path(args.dest_root) / args.date / args.exchange
     files = sorted(root.glob("*/BTCUSDT_orderbook.parquet"))
     log(f"found {len(files)} hour files in {root} (mode={args.mode})")
 
@@ -89,7 +91,9 @@ def main() -> None:
     log(f"total band rows: {band_all.height:,} | total minute rows: {mid_all.height:,}")
 
     suffix = "_sparse" if args.mode == "sparse" else ""
-    out = args.out or f"data/{args.date}/{args.exchange}_minute_band{suffix}.parquet"
+    out = args.out or str(
+        Path(args.dest_root) / args.date / f"{args.exchange}_minute_band{suffix}.parquet"
+    )
     band_all.write_parquet(out)
     mid_all.write_parquet(out.replace(".parquet", "_mid.parquet"))
     log(f"wrote {out} and *_mid.parquet")

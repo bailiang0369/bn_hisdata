@@ -39,6 +39,7 @@ from pathlib import Path
 import zstandard as zstd
 
 HERE = Path(__file__).resolve().parent
+DATA = HERE / "data"  # module-local data root (absolute, cwd-independent)
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 EXCHANGES = ["binance_spot", "binance_futures"]
 
@@ -85,6 +86,7 @@ def build(date: str, exchanges: list[str], dest_root: str, band: float) -> None:
     for ex in exchanges:
         run_cmd([sys.executable, "build_minute_snapshots.py",
                  "--date", date, "--exchange", ex, "--band", str(band),
+                 "--dest-root", dest_root,
                  "--out", f"{dest_root}/{date}/{ex}_minute_band.parquet"])
 
 
@@ -125,7 +127,8 @@ def main() -> int:
     ap.add_argument("--start-date", help="range start YYYY-MM-DD (inclusive)")
     ap.add_argument("--end-date", help="range end YYYY-MM-DD (inclusive)")
     ap.add_argument("--exchange", nargs="+", default=EXCHANGES, choices=EXCHANGES)
-    ap.add_argument("--dest-root", default="data")
+    ap.add_argument("--dest-root", default=str(DATA),
+                    help="Local data root (default: <module>/data)")
     ap.add_argument("--band", type=float, default=0.003)
     ap.add_argument("--download", choices=["api", "r2"], default="api",
                     help="api=anonymous (slow), r2=fast (needs CHD_API_KEY)")

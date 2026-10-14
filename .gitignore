@@ -1,6 +1,6 @@
 # Large, regenerable data (raw orderbook hourly files + processed snapshots).
-# Recreated by pipeline.py; do NOT commit.
-data/
+# Recreated by pipeline.py; do NOT commit. Matches any module's data/ dir.
+**/data/
 
 # Python
 __pycache__/
