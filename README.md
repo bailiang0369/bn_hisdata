@@ -24,5 +24,5 @@ python orderbook/build_minute_snapshots.py --date 2026-10-12 --exchange binance_
 python orderbook/validate_snapshot_consistency.py --date 2026-10-12 --exchange binance_spot
 ```
 
-数据默认落在 `orderbook/data/`（已在 `.gitignore` 中忽略，不入库）。依赖见
-`orderbook/requirements.txt`（`polars`、`zstandard`）。
+数据默认落在 `orderbook/data/`（已在 `.gitignore` 中忽略，不入库）。项目依赖见
+根目录 `requirements.txt`（`polars`、`zstandard`）。
