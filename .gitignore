@@ -1,0 +1,14 @@
+# Large, regenerable data (raw orderbook hourly files + processed snapshots).
+# Recreated by pipeline.py; do NOT commit.
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs / error dumps
+*.log
+*.err
+
+# Project data
+.codebuddy/
