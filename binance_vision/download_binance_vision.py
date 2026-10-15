@@ -44,8 +44,8 @@ Examples
 """
 import argparse
 import hashlib
-import io
 import sys
+import time
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
@@ -131,19 +131,31 @@ def sha256_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def verify_checksum(url_checksum: str, data: bytes, log) -> None:
+def verify_checksum(url_checksum: str, data: bytes, log) -> bool:
+    """True = 可用（校验通过，或无法校验而跳过）；False = 哈希确实不匹配。
+
+    只有"真的不匹配"才返回 False，让调用方丢弃响应并重试，绝不写出损坏文件；
+    取不到 CHECKSUM、文件为空等一律视为跳过（True），避免误伤正常下载。
+    """
     try:
         r = requests.get(url_checksum, timeout=30)
-        if r.status_code == 200:
-            expected = r.text.strip().split()[0]
-            actual = sha256_of(data)
-            if expected.lower() != actual.lower():
-                raise ValueError(f"expected {expected}, got {actual}")
-            log("checksum OK")
-        else:
+        if r.status_code != 200:
             log(f"no checksum file (HTTP {r.status_code}), skipped")
-    except Exception as e:  # checksum is a safety net, never fatal
+            return True
+        text = r.text.strip()
+        if not text:
+            log("empty checksum file, skipped")
+            return True
+        expected = text.split()[0]
+        actual = sha256_of(data)
+        if expected.lower() != actual.lower():
+            log(f"CHECKSUM MISMATCH: expected {expected}, got {actual}")
+            return False
+        log("checksum OK")
+        return True
+    except Exception as e:  # 校验是安全网：只有真实不匹配才失败
         log(f"checksum check skipped: {e}")
+        return True
 
 
 def download_one(url: str, dest: Path, verify: bool, log) -> str:
@@ -157,17 +169,22 @@ def download_one(url: str, dest: Path, verify: bool, log) -> str:
             r = requests.get(url, timeout=120)
             if r.status_code == 200:
                 data = r.content
-                if verify:
-                    verify_checksum(url + ".CHECKSUM", data, log)
-                dest.write_bytes(data)
-                log(f"saved {len(data) / 1e6:.1f} MB")
-                return "ok"
-            if r.status_code == 404:
+                # 校验和真的不匹配 -> 丢弃本次响应并重试，绝不写出损坏文件
+                if verify and not verify_checksum(url + ".CHECKSUM", data, log):
+                    last = "checksum mismatch"
+                else:
+                    dest.write_bytes(data)
+                    log(f"saved {len(data) / 1e6:.1f} MB")
+                    return "ok"
+            elif r.status_code == 404:
                 log(f"MISSING (HTTP 404): {url}")
                 return "missing"
-            last = r.status_code
+            else:
+                last = r.status_code
         except Exception as e:  # transient network error -> retry
             last = e
+        if attempt < 3:
+            time.sleep(2 ** attempt)  # 指数退避，避免连续猛打源站
         log(f"attempt {attempt} failed ({last}); retrying")
     log(f"FAILED after retries: {url}")
     return "failed"
@@ -188,19 +205,23 @@ def process(zip_path: Path, category: str, log) -> None:
         if not csv_in:
             log("no csv inside zip")
             return
-        raw = z.read(csv_in[0]).decode("utf-8").splitlines()
-    if not raw:
-        return
-    # Detect header by the first token (a header's first col name is text;
-    # a data row's first field is a timestamp/number).
-    exp = EXPECTED_FIRST.get(category)
-    is_header = bool(exp) and raw[0].split(",")[0].strip() == exp
-    text = "\n".join(raw)
-    if is_header:
-        df = pl.read_csv(io.StringIO(text), has_header=True)
-    else:
-        df = pl.read_csv(io.StringIO(text), has_header=False,
-                         new_columns=CANONICAL[category])
+        # 直接把 zip 内的文件对象交给 polars 流式解析：不再 read+decode+splitlines
+        # +join+StringIO 三重拷贝（旧实现峰值约 CSV 的 3-4 倍，月度 aggTrades 会爆内存）。
+        with z.open(csv_in[0]) as fh:
+            first = fh.readline().decode("utf-8", errors="replace")
+            if not first.strip():
+                log("empty csv inside zip")
+                return
+            # Detect header by the first token (a header's first col name is text;
+            # a data row's first field is a timestamp/number).
+            exp = EXPECTED_FIRST.get(category)
+            is_header = bool(exp) and first.split(",")[0].strip() == exp
+            fh.seek(0)
+            if is_header:
+                df = pl.read_csv(fh, has_header=True)
+            else:
+                df = pl.read_csv(fh, has_header=False,
+                                 new_columns=CANONICAL[category])
     if category == "klines":
         df = df.select(KLINE_KEEP).with_columns([
             pl.col("open_time").cast(pl.Int64),
@@ -213,7 +234,7 @@ def process(zip_path: Path, category: str, log) -> None:
             pl.col("count").cast(pl.Int64),
             pl.col("taker_buy_volume").cast(pl.Float64),
         ])
-    out.write_text(df.write_csv(), encoding="utf-8")
+    df.write_csv(str(out))  # 直接落盘，避免先在内存拼出整份 CSV 文本
     log(f"cleaned -> {out.name}")
 
 
@@ -279,14 +300,27 @@ def main() -> None:
                         continue
                     status = download_one(url, dp, not args.no_checksum,
                                           lambda m: log(tag, m))
-                    totals[status] = totals.get(status, 0) + 1
-                    if status in ("ok", "skip") and not args.no_extract:
+                    if status not in ("ok", "skip"):
+                        totals[status] = totals.get(status, 0) + 1
+                        continue
+                    if args.no_extract:
+                        totals[status] = totals.get(status, 0) + 1
+                        continue
+                    try:
                         process(dp, cat, lambda m: log(tag, m))
-                        # Source zip is now redundant; drop it to save space
-                        # (matters a lot for monthly backfills).
+                    except Exception as e:  # 坏 zip / 列数不符只影响这一个周期
+                        log(tag, f"process FAILED: {e}; removing zip for retry")
                         if dp.exists():
                             dp.unlink()
-                            log(tag, "removed source zip")
+                        totals["failed"] += 1
+                        continue
+                    # Source zip is now redundant; drop it to save space
+                    # (matters a lot for monthly backfills).
+                    if dp.exists():
+                        dp.unlink()
+                        log(tag, "removed source zip")
+                    # status=="skip" 表示复用了上次中断残留的 zip；本次确实完成了处理，计为 ok
+                    totals["ok"] += 1
 
     print("\n==== summary ====")
     print(f"ok={totals['ok']} skip={totals['skip']} "
