@@ -2,8 +2,8 @@
 import requests
 
 url = "https://api.cryptohftdata.com/v1/download"
-params = {"file": "binance_spot/2025-08-01/20/BTCUSDT_orderbook.parquet"}
-out = "data/sample_hour.parquet"
+params = {"file": "binance_spot/2025-08-01/20/BTCUSDT_orderbook.parquet.zst"}
+out = "data/sample_hour.parquet.zst"
 
 import os
 os.makedirs("data", exist_ok=True)

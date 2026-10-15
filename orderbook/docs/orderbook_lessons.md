@@ -19,6 +19,8 @@
 orderbook/data/{date}/{exchange}/{HH}/BTCUSDT_orderbook.parquet[.zst]   # 原始（按小时分存）
 orderbook/data/{date}/{exchange}_minute_band.parquet                   # 处理后（按天合并）
 orderbook/data/{date}/{exchange}_minute_band_mid.parquet
+orderbook/data/monthly/{exchange}_minute_band_{YYYY-MM}.parquet        # 月度聚合（特征计算用，见 §9）
+orderbook/data/monthly/{exchange}_minute_band_mid_{YYYY-MM}.parquet
 ```
 
 > 本仓库的订单簿相关代码都放在 `orderbook/` 目录下。从**仓库根目录**运行，例如
@@ -104,6 +106,8 @@ Binance 的 local-depth diff 流在**连接 / 重连**时会重发一份快照�
 - band 字段：`bucket, side, px, q, mid`（±0.3% 内的档位）。
 - mid 字段：`bucket, best_bid, best_ask, mid, spread`（每分钟一行）。
 - 窄表体积 ≈ 原始的 **~2%（合约）/ ~8%（现货）**，已是算特征直接可用的数值表。
+- 全量窄表（两市场 ~474 天）约 8–9GB，按天文件有 ~950 个、过多；一次性整体加载又太大。提供
+  `merge_monthly.py` 把每日窄表按 (交易所, 月份) 进一步聚合成**月度 parquet**（见 §9），作为特征计算的折中粒度。
 
 ---
 
@@ -138,7 +142,36 @@ Binance 的 local-depth diff 流在**连接 / 重连**时会重发一份快照�
 1. **永远把快照当整书替换**（§1）——这是头号坑。
 2. **跨小时边界校验当守门员**（§2），任何重建逻辑改动后必跑。
 3. **不要碰单个日级大文件**；按天 / 按小时处理（§4）。
-4. **处理完当天立即删原始、清内存**（§7），避免磁盘与内存累积。
+4. **处理完当天立即删原始、清内存**（§7），避免磁盘与内存累积。聚合成月度后同样删每日快照（§9），避免窄表两级并存占双倍空间。
 5. **zst 历史文件必须按 magic 归一化**（§5），否则读不出。
 6. **特征从窄表衍生，与重建解耦**（§6）——改特征不必重跑重建，重建是一次性基础工程。
 7. 单文件内 polars 已多核并行，**天内并行无意义**，要提速就**跨天并行**。
+
+---
+
+## 9. 月度聚合（特征计算的折中粒度）
+
+全量窄表（两市场 ~474 天）约 8–9GB，按天文件 ~950 个、太多；一次性整体加载又太大。
+`merge_monthly.py` 把每日窄表按 **(交易所, 月份)** 合并成月度 parquet，作为特征计算的折中粒度：
+
+- 输入：`data/{date}/{exchange}_minute_band.parquet` / `..._minute_band_mid.parquet`
+- 输出：`data/monthly/{exchange}_minute_band_{YYYY-MM}.parquet` / `..._mid_{YYYY-MM}.parquet`
+- 月份由日期文件夹名推导（每日数据天然属于同一 UTC 日历月，不会跨月切割）；月份内按 `bucket` 排序。
+- 用 polars 惰性 `concat` + `sink_parquet` 流式写出，单月也不整月入内存（对 Colab/Kaggle 的 12–16GB 友好）。
+
+```bash
+# 全量聚合（两市场）
+python orderbook/merge_monthly.py --dest-root orderbook/data
+# 只聚合合约 + 合并后删除每日快照
+python orderbook/merge_monthly.py --dest-root orderbook/data --exchange binance_futures --delete-daily
+```
+
+### 删除链（每一步只留"当前最细粒度"的产物）
+1. `pipeline.py`：下载原始小时文件 → 构建快照 → **删除原始小时目录** `data/{date}/{exchange}/`（见 `cleanup()`）。
+   所以磁盘同一时刻只压着"当天 raw + 已累计的窄表"，永不需要为 280GB 原始预留空间。
+2. `merge_monthly.py`：每日快照 → 月度聚合。合并成功后可加 **`--delete-daily` 删除每日快照**
+   `data/{date}/{exchange}_minute_band*.parquet`，只留月度文件。这一步**默认不删**（避免聚合出错时丢失每日数据），
+   作为收尾步骤显式执行，最终磁盘只留 `data/monthly/`。
+
+> 断点续传：月度文件已存在则跳过整月；若某个月是分多段补下的，补完后再跑一次
+> `merge_monthly.py --force` 重建受影响月份，否则已存在的月份会被跳过、漏掉新增的天。

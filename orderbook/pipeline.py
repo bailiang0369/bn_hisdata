@@ -24,6 +24,9 @@ Usage:
 Outputs (per day, per exchange):
   data/{date}/{exchange}_minute_band.parquet
   data/{date}/{exchange}_minute_band_mid.parquet
+
+The per-day snapshots can be further aggregated into month-level parquet via
+merge_monthly.py (useful when the full narrow table grows too large to load at once).
 """
 from __future__ import annotations
 

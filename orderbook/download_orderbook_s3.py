@@ -20,6 +20,7 @@ Run:
 import argparse
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -81,6 +82,8 @@ def _write_payload(body, dest: Path, decompress: bool) -> int:
         if len(head) >= len(ZSTD_MAGIC):
             break
     wire = len(head)
+    if wire == 0:
+        raise RuntimeError("empty object body received")
     wrapped = decompress and head.startswith(ZSTD_MAGIC)
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_name(dest.name + ".part")
@@ -121,51 +124,95 @@ def main() -> int:
     date = args.date
     creds = get_credentials(api_key, timeout=90, retries=5)
     bucket = creds["bucket"]
-    c = creds["credentials"]
-    # Large per-request timeout: a 17 MB futures file at limited egress speed
-    # can take well over a minute to stream, so the default 60 s would time out.
-    client = S3LiteClient(
-        endpoint=creds["endpoint"],
-        access_key_id=c["access_key_id"],
-        secret_access_key=c["secret_access_key"],
-        session_token=c.get("session_token"),
-        region=creds.get("region") or "auto",
-        max_pool_connections=args.workers,
-        timeout=1800,
-        max_attempts=5,
-    )
+
+    def build_client(cr):
+        # Large per-request timeout: a 17 MB futures file at limited egress speed
+        # can take well over a minute to stream, so the default 60 s would time out.
+        return S3LiteClient(
+            endpoint=cr["endpoint"],
+            access_key_id=cr["credentials"]["access_key_id"],
+            secret_access_key=cr["credentials"]["secret_access_key"],
+            session_token=cr["credentials"].get("session_token"),
+            region=cr.get("region") or "auto",
+            max_pool_connections=args.workers,
+            timeout=1800,
+            max_attempts=5,
+        )
+
+    client = build_client(creds)
+
+    # R2 短期凭证可能在大批量/慢网下过期。worker 遇到鉴权错误时加锁刷新一次，
+    # 由首个命中过期的线程执行，其余线程复用新凭证，避免重复关闭正在使用的 client。
+    cred_state = {"client": client, "gen": 0}
+    cred_lock = threading.Lock()
+    AUTH_CODES = {"ExpiredToken", "InvalidToken", "AccessDenied",
+                  "SignatureDoesNotMatch", "InvalidAccessKeyId"}
+
+    def refresh_credentials(expected_gen: int) -> None:
+        with cred_lock:
+            if cred_state["gen"] != expected_gen:
+                return  # 已有别的线程刷新过
+            new_creds = get_credentials(api_key, timeout=90, retries=5)
+            new_client = build_client(new_creds)
+            old = cred_state["client"]
+            cred_state["client"] = new_client
+            cred_state["gen"] += 1
+            old.close()
+
+    def _is_auth_error(exc: S3LiteError) -> bool:
+        code = exc.response.get("Error", {}).get("Code", "")
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return code in AUTH_CODES or status == 403
 
     root = Path(args.dest_root) / date
     hours = args.hours if args.hours is not None else list(range(24))
     jobs = [(ex, h) for ex in EXCHANGES for h in hours]
 
-    cutover = date >= NATIVE_ZSTD_CUTOVER_DATE
+    cutover = datetime.fromisoformat(args.date) >= datetime.fromisoformat(NATIVE_ZSTD_CUTOVER_DATE)
     suffixes = (".parquet", ".parquet.zst") if cutover else (".parquet.zst", ".parquet")
 
     def worker(exchange: str, hour: int) -> tuple[str, str, int]:
         label = f"{exchange}/{hour:02d}"
         dest = root / exchange / f"{hour:02d}" / f"{SYMBOL}_{DATA_TYPE}.parquet"
+        # _write_payload 总是解压，所以无论命中 .parquet 还是 .parquet.zst，落盘都是
+        # 无压缩的 .parquet：文件名与内容一致，且跳过判断对 pre-cutover 也成立。
         if dest.exists():
             return (label, "skip", dest.stat().st_size)
         key0 = f"{exchange}/{date}/{hour:02d}/{SYMBOL}_{DATA_TYPE}"
-        for idx, suffix in enumerate(suffixes):
+        for suffix in suffixes:
             key = key0 + suffix
-            try:
-                resp = client.get_object(Bucket=bucket, Key=key)
-            except S3LiteError as exc:
-                code = exc.response.get("Error", {}).get("Code", "")
-                status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                if code in ("NoSuchKey", "404", "NotFound") or status == 404:
-                    continue  # try the other spelling, or report miss at the end
-                return (label, f"err:{code}", 0)
-            target = dest
-            if suffix == ".parquet.zst":
-                target = dest.with_name(dest.name + ".zst")
-            try:
-                size = _write_payload(_iter_body(resp["Body"]), target, decompress=True)
-            finally:
-                resp["Body"].close()
-            return (label, "ok", size)
+            my_gen = cred_state["gen"]
+            refreshed = False
+            while True:
+                cl = cred_state["client"]
+                try:
+                    resp = cl.get_object(Bucket=bucket, Key=key)
+                except S3LiteError as exc:
+                    code = exc.response.get("Error", {}).get("Code", "")
+                    status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                    if code in ("NoSuchKey", "404", "NotFound") or status == 404:
+                        break  # 该拼写不存在 -> 尝试另一个后缀，或最后报 miss
+                    if _is_auth_error(exc) and not refreshed:
+                        refreshed = True
+                        # refresh_credentials 内部按 gen 幂等：若别的线程已刷新则为空操作，
+                        # 随后用当前（已是最新）client 重试，避免过期瞬间整批误报 err。
+                        try:
+                            refresh_credentials(my_gen)
+                        except Exception:  # noqa: BLE001 - 刷新失败则报 err 而非崩溃
+                            return (label, "err:refresh", 0)
+                        continue  # 用当前 client 重试本 key
+                    return (label, f"err:{code}", 0)
+                try:
+                    size = _write_payload(_iter_body(resp["Body"]), dest, decompress=True)
+                except Exception as exc:  # noqa: BLE001 - 单个小时失败不应中断整轮
+                    return (label, f"err:{type(exc).__name__}", 0)
+                finally:
+                    resp["Body"].close()
+                # 完整性校验：落盘字节数应等于响应声明的 Content-Length
+                expected = resp.get("ContentLength", 0) or 0
+                if expected and size != expected:
+                    return (label, f"err:size {size}!={expected}", 0)
+                return (label, "ok", size)
         return (label, "404", 0)
 
     def _iter_body(body):
@@ -191,7 +238,7 @@ def main() -> int:
                 print(f"404  {label}")
             else:
                 print(f"ERR  {label}: {status}", file=sys.stderr)
-    client.close()
+    cred_state["client"].close()
 
     dt = time.time() - t0
     print(f"\nDone in {dt:.1f}s: {ok} downloaded, {skip} present, {miss} missing for {date}")

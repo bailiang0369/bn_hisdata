@@ -1,12 +1,13 @@
 """匿名下载 CryptoHFTData 一天的 BTCUSDT L2 订单簿（每小时一个文件）。
 
 用法: python download_day.py --date 2026-10-13 [--exchange binance_futures]
-本地布局: data/{date}/{exchange}/{HH}/BTCUSDT_orderbook.parquet[.zst]
+本地布局: data/{date}/{exchange}/{HH}/BTCUSDT_orderbook.parquet
 """
 import argparse
 import http.client
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 import requests
@@ -16,6 +17,7 @@ API_BASE = "https://api.cryptohftdata.com/v1"
 SYMBOL = "BTCUSDT"
 DATA_TYPE = "orderbook"
 NATIVE_ZSTD_CUTOVER_DATE = "2026-08-19"  # 之后为裸 .parquet，之前为 .parquet.zst
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
 def get_object(key: str, retries: int = 5) -> bytes | None:
@@ -54,14 +56,20 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(args.dest_root) / args.date / args.exchange
-    cutover = args.date >= NATIVE_ZSTD_CUTOVER_DATE
+    cutover = date.fromisoformat(args.date) >= date.fromisoformat(NATIVE_ZSTD_CUTOVER_DATE)
     suffixes = (".parquet", ".parquet.zst") if cutover else (".parquet.zst", ".parquet")
 
     ok = miss = 0
     for hour in range(24):
         dest_dir = root / f"{hour:02d}"
-        dest = dest_dir / f"{SYMBOL}_{DATA_TYPE}.parquet"
-        if dest.exists():
+        # pre-cutover 落盘为 .parquet.zst、cutover+ 落盘为 .parquet；两种都视为已存在，
+        # 这样任意日期的重跑都是安全无操作，不会重复下载。
+        existing = next(
+            (dest_dir / f"{SYMBOL}_{DATA_TYPE}{s}" for s in suffixes
+             if (dest_dir / f"{SYMBOL}_{DATA_TYPE}{s}").exists()),
+            None,
+        )
+        if existing is not None:
             print(f"skip {args.exchange} {hour:02d} (exists)")
             ok += 1
             continue
@@ -69,12 +77,18 @@ def main() -> int:
         for suffix in suffixes:
             key = f"{args.exchange}/{args.date}/{hour:02d}/{SYMBOL}_{DATA_TYPE}{suffix}"
             data = get_object(key)
-            if data is not None:
-                dest = dest_dir / f"{SYMBOL}_{DATA_TYPE}{suffix}"
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(data)
-                got = len(data)
-                break
+            if data is None:
+                continue
+            # 与 R2 下载器保持一致：无论命中哪个 key，落盘均为无压缩的 .parquet，
+            # 使两种后端可互换、下游无需按扩展名嗅探魔数。
+            if data[:4] == ZSTD_MAGIC:
+                import zstandard as zstd
+                data = zstd.ZstdDecompressor().decompress(data)
+            dest = dest_dir / f"{SYMBOL}_{DATA_TYPE}.parquet"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            got = len(data)
+            break
         if got is None:
             miss += 1
             print(f"404  {args.exchange} {hour:02d}")

@@ -22,6 +22,9 @@ python orderbook/download_day.py --date 2026-10-12 --exchange binance_spot      
 python orderbook/download_orderbook_s3.py --date 2026-10-12                       # R2 直连（需 CHD_API_KEY）
 python orderbook/build_minute_snapshots.py --date 2026-10-12 --exchange binance_spot
 python orderbook/validate_snapshot_consistency.py --date 2026-10-12 --exchange binance_spot
+
+# 把每日窄表聚合成月度 parquet（特征计算的折中粒度，可选）
+python orderbook/merge_monthly.py --dest-root orderbook/data
 ```
 
 数据默认落在 `orderbook/data/`（已在 `.gitignore` 中忽略，不入库）。项目依赖见
