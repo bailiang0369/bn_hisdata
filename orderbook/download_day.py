@@ -22,7 +22,9 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 def get_object(key: str, retries: int = 5) -> bytes | None:
     url = f"{API_BASE}/download"
-    for attempt in range(retries):
+    attempt = 0
+    rate_limited = 0
+    while attempt < retries:
         try:
             with requests.get(
                 url, params={"file": key}, stream=True, timeout=300
@@ -30,6 +32,11 @@ def get_object(key: str, retries: int = 5) -> bytes | None:
                 if resp.status_code == 404:
                     return None
                 if resp.status_code == 429:
+                    # 限流不消耗重试预算（否则最后一次尝试撞上 429 会直接 RuntimeError
+                    # 中断整天），但仍单独计数，避免被永久限流时死循环。
+                    rate_limited += 1
+                    if rate_limited > retries:
+                        raise RuntimeError(f"rate limited {rate_limited}x: {key}")
                     retry = int(resp.headers.get("Retry-After", 10))
                     print(f"  rate limited, sleep {retry}s", file=sys.stderr)
                     time.sleep(retry)
@@ -40,8 +47,9 @@ def get_object(key: str, retries: int = 5) -> bytes | None:
                     chunks.append(chunk)
                 return b"".join(chunks)
         except (requests.RequestException, http.client.IncompleteRead) as exc:
-            wait = 2 * (attempt + 1)
-            print(f"  attempt {attempt + 1} failed for {key}: {exc}; retry in {wait}s",
+            attempt += 1
+            wait = 2 * attempt
+            print(f"  attempt {attempt} failed for {key}: {exc}; retry in {wait}s",
                   file=sys.stderr)
             time.sleep(wait)
     raise RuntimeError(f"failed after {retries} retries: {key}")
@@ -78,6 +86,11 @@ def main() -> int:
             key = f"{args.exchange}/{args.date}/{hour:02d}/{SYMBOL}_{DATA_TYPE}{suffix}"
             data = get_object(key)
             if data is None:
+                continue
+            if not data:
+                # 空响应（与 S3 路径的 wire==0 保护对齐）：不当成有效文件落盘，
+                # 否则会写出 0 字节 parquet，直到 build 阶段才报一个难懂的错。
+                print(f"  empty body for {key}; treating as miss", file=sys.stderr)
                 continue
             # 与 R2 下载器保持一致：无论命中哪个 key，落盘均为无压缩的 .parquet，
             # 使两种后端可互换、下游无需按扩展名嗅探魔数。

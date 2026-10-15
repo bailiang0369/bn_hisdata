@@ -76,11 +76,12 @@ def reconstruct_state(df_raw: pl.DataFrame) -> pl.DataFrame:
     return merged
 
 
-def reconstruct_state_sparse(df_raw: pl.DataFrame, safety: float = 0.02) -> pl.DataFrame:
+def reconstruct_state_sparse(df_raw: pl.DataFrame, band: float = 0.003,
+                             safety: float = 0.02) -> pl.DataFrame:
     """Memory-bounded variant of :func:`reconstruct_state`.
 
     A level can only ever appear inside the +-band around mid if its price lies
-    in the (conservative) window ``[0.997*mid_lo, 1.003*mid_hi]`` where
+    in the (conservative) window ``[(1-band)*mid_lo, (1+band)*mid_hi]`` where
     ``mid_lo/mid_hi`` are the file's extreme mids. We derive a *conservative*
     mid range from the file's snapshot mids, then widen it by a small margin
     that covers intra-file price swings (absolute ``safety`` of the mid, plus a
@@ -143,8 +144,11 @@ def reconstruct_state_sparse(df_raw: pl.DataFrame, safety: float = 0.02) -> pl.D
         # margin covers both intra-file swings and snapshot gaps:
         # a small absolute fraction of mid, and a fraction of the mid span
         margin = max(safety * mid_hi, 0.05 * span)
-        win_lo = 0.997 * mid_lo - margin
-        win_hi = 1.003 * mid_hi + margin
+        # 窗口由 band 推导（不再写死 0.997/1.003）：保证绝不会把目标带内的档位提前
+        # 裁掉。band=0.003 时即 ±0.3%，与 process_hour 最终的 band 过滤完全一致；
+        # 若以后换更宽的 band，这里也随之放大，不会 silently 漏档位。
+        win_lo = (1 - band) * mid_lo - margin
+        win_hi = (1 + band) * mid_hi + margin
         base = base.filter(pl.col("px").is_between(win_lo, win_hi))
 
     base = base.with_columns(

@@ -17,6 +17,7 @@ Usage:
     python build_minute_snapshots.py --date 2026-10-12 --exchange binance_spot
 """
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -38,7 +39,7 @@ def process_hour(path: Path, band: float, mode: str = "dense"):
     )
     # single-pass as-of reconstruction (snapshots = full-book replacement)
     if mode == "sparse":
-        merged = reconstruct_state_sparse(df)
+        merged = reconstruct_state_sparse(df, band=band)
     else:
         merged = reconstruct_state(df)
 
@@ -77,6 +78,11 @@ def main() -> None:
     root = Path(args.dest_root) / args.date / args.exchange
     files = sorted(root.glob("*/BTCUSDT_orderbook.parquet"))
     log(f"found {len(files)} hour files in {root} (mode={args.mode})")
+    if not files:
+        # 该天没有任何小时文件（全 404 / 下载失败 / 目录不存在）。用非零退出让
+        # pipeline 感知失败，而不是让 pl.concat([]) 抛一个难懂的错。
+        print(f"ERROR: no hour files under {root}; nothing to build", file=sys.stderr)
+        raise SystemExit(3)
 
     bands, mids = [], []
     for i, f in enumerate(files):

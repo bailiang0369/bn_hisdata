@@ -173,8 +173,17 @@ def parse_error_response(body: bytes, status: int) -> S3LiteError:
     message = f"Request failed with status {status}"
     try:
         root = _parse_xml(body)
+        # S3/R2 的错误体带默认命名空间；同时兼容有/无命名空间两种形态，确保拿到
+        # 真实错误码。否则鉴权错误只会显示成 HTTP403，无法按 Code 精确分类，
+        # 也无法在非 403 状态下触发凭证刷新。
+        # 注意：不能用 `a or b` 兜底——ElementTree 中无子元素的 Element 求值为
+        # False，`find("Code") or find(ns+"Code")` 会把已命中的节点误判为 None。
         code_node = root.find("Code")
+        if code_node is None:
+            code_node = root.find(f"{LIST_NAMESPACE}Code")
         message_node = root.find("Message")
+        if message_node is None:
+            message_node = root.find(f"{LIST_NAMESPACE}Message")
         if code_node is not None and code_node.text:
             code = code_node.text
         if message_node is not None and message_node.text:

@@ -77,20 +77,27 @@ def run_cmd(args: list[str]) -> int:
 def download(date: str, exchanges: list[str], dest_root: str, backend: str) -> None:
     if backend == "r2":
         # R2 fetches both exchanges in one invocation
-        run_cmd([sys.executable, "download_orderbook_s3.py",
-                 "--date", date, "--dest-root", dest_root])
+        rc = run_cmd([sys.executable, "download_orderbook_s3.py",
+                      "--date", date, "--dest-root", dest_root])
     else:
+        rc = 0
         for ex in exchanges:
-            run_cmd([sys.executable, "download_day.py",
-                     "--date", date, "--exchange", ex, "--dest-root", dest_root])
+            rc = run_cmd([sys.executable, "download_day.py",
+                          "--date", date, "--exchange", ex, "--dest-root", dest_root])
+            if rc != 0:
+                break
+    if rc != 0:
+        raise RuntimeError(f"download failed (rc={rc}) for {date}")
 
 
 def build(date: str, exchanges: list[str], dest_root: str, band: float) -> None:
     for ex in exchanges:
-        run_cmd([sys.executable, "build_minute_snapshots.py",
-                 "--date", date, "--exchange", ex, "--band", str(band),
-                 "--dest-root", dest_root,
-                 "--out", f"{dest_root}/{date}/{ex}_minute_band.parquet"])
+        rc = run_cmd([sys.executable, "build_minute_snapshots.py",
+                      "--date", date, "--exchange", ex, "--band", str(band),
+                      "--dest-root", dest_root,
+                      "--out", f"{dest_root}/{date}/{ex}_minute_band.parquet"])
+        if rc != 0:
+            raise RuntimeError(f"build failed (rc={rc}) for {ex} {date}")
 
 
 def cleanup(date: str, exchanges: list[str], dest_root: str) -> None:
@@ -120,8 +127,12 @@ def process_day(date: str, exchanges: list[str], dest_root: str,
 
 
 def _all_built(date: str, exchanges: list[str], dest_root: str) -> bool:
-    return all(Path(f"{dest_root}/{date}/{ex}_minute_band.parquet").exists()
-               for ex in exchanges)
+    """band 与 mid 两个文件都在才算完成，避免两步写入之间崩溃导致 mid 永久缺失。"""
+    for ex in exchanges:
+        for suffix in ("_minute_band.parquet", "_minute_band_mid.parquet"):
+            if not Path(f"{dest_root}/{date}/{ex}{suffix}").exists():
+                return False
+    return True
 
 
 def main() -> int:
@@ -155,11 +166,20 @@ def main() -> int:
         print("specify --date or both --start-date and --end-date", file=sys.stderr)
         return 2
 
+    failed: list[str] = []
     for d in days:
         if _all_built(d, exchanges, args.dest_root):
             print(f"skip {d} (band already built)", flush=True)
             continue
-        process_day(d, exchanges, args.dest_root, args.band, args.download)
+        try:
+            process_day(d, exchanges, args.dest_root, args.band, args.download)
+        except Exception as exc:  # noqa: BLE001 - 单日失败显式记录并继续，不静默吞掉
+            print(f"  FAILED {d}: {exc}", file=sys.stderr, flush=True)
+            failed.append(d)
+    if failed:
+        print(f"\n{len(failed)} day(s) failed (NOT marked done, will retry on re-run): "
+              f"{', '.join(failed)}", file=sys.stderr, flush=True)
+        return 1
     return 0
 
 

@@ -39,7 +39,6 @@ DATA_TYPE = "orderbook"
 # After this date objects are bare .parquet; before it they are .parquet.zst.
 NATIVE_ZSTD_CUTOVER_DATE = "2026-08-19"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
-OBJECT_SUFFIXES = (".parquet.zst", ".parquet")
 
 
 def get_credentials(api_key: str, timeout: int = 90, retries: int = 5) -> dict:
@@ -87,22 +86,27 @@ def _write_payload(body, dest: Path, decompress: bool) -> int:
     wrapped = decompress and head.startswith(ZSTD_MAGIC)
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_name(dest.name + ".part")
-    with partial.open("wb") as out:
-        if wrapped:
-            writer = zstd.ZstdDecompressor().stream_writer(out, closefd=False)
-        else:
-            writer = out
-        try:
-            writer.write(head)
-            for chunk in body:
-                if not chunk:
-                    continue
-                writer.write(chunk)
-                wire += len(chunk)
-        finally:
+    try:
+        with partial.open("wb") as out:
             if wrapped:
-                writer.close()
-    os.replace(partial, dest)
+                writer = zstd.ZstdDecompressor().stream_writer(out, closefd=False)
+            else:
+                writer = out
+            try:
+                writer.write(head)
+                for chunk in body:
+                    if not chunk:
+                        continue
+                    writer.write(chunk)
+                    wire += len(chunk)
+            finally:
+                if wrapped:
+                    writer.close()
+        os.replace(partial, dest)
+    except BaseException:
+        # 失败不留下 .part 残file：多次失败会堆积孤儿文件，而续传判断只看 dest。
+        partial.unlink(missing_ok=True)
+        raise
     return wire
 
 
