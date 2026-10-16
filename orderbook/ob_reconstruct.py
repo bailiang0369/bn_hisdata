@@ -15,6 +15,31 @@ records for exactly those levels, then doing a single as-of last-value groupby.
 import polars as pl
 
 
+def _synthesize_removals(base: pl.DataFrame, snaps: pl.DataFrame, snap_times: list[int]) -> list[pl.DataFrame]:
+    if not snap_times:
+        return []
+    base_sorted = base.sort(["side", "px", "event_time"])
+    removal_frames = []
+    for Ts in snap_times:
+        before = base_sorted.filter(pl.col("event_time") < Ts)
+        if before.height == 0:
+            continue
+        alive = (
+            before.group_by(["side", "px"])
+            .last()
+            .filter(pl.col("qty") > 0)
+            .select(["side", "px"])
+        )
+        in_snap = snaps.filter(pl.col("event_time") == Ts).select(["side", "px"])
+        rem = alive.join(in_snap, on=["side", "px"], how="anti")
+        rem = rem.with_columns([
+            pl.lit(0.0).cast(pl.Float64).alias("qty"),
+            pl.lit(Ts).cast(pl.Int64).alias("event_time"),
+        ])
+        removal_frames.append(rem)
+    return removal_frames
+
+
 def reconstruct_state(df_raw: pl.DataFrame) -> pl.DataFrame:
     """Return the full per-(side, px, minute-bucket) book state.
 
@@ -45,25 +70,7 @@ def reconstruct_state(df_raw: pl.DataFrame) -> pl.DataFrame:
     )
 
     # synthesize removals for levels alive just before each snapshot but absent
-    removal_frames = []
-    for Ts in snap_times:
-        before = base.filter(pl.col("event_time") < Ts)
-        if before.height == 0:
-            continue
-        alive = (
-            before.sort(["side", "px", "event_time"])
-            .group_by(["side", "px"])
-            .agg(pl.col("qty").sort_by("event_time").last().alias("qv"))
-            .filter(pl.col("qv") > 0)
-            .select(["side", "px"])
-        )
-        in_snap = snaps.filter(pl.col("event_time") == Ts).select(["side", "px"])
-        rem = alive.join(in_snap, on=["side", "px"], how="anti")
-        rem = rem.with_columns([
-            pl.lit(0.0).cast(pl.Float64).alias("qty"),
-            pl.lit(Ts).cast(pl.Int64).alias("event_time"),
-        ])
-        removal_frames.append(rem)
+    removal_frames = _synthesize_removals(base, snaps, snap_times)
     if removal_frames:
         base = pl.concat([base] + removal_frames, how="diagonal")
 
@@ -116,25 +123,7 @@ def reconstruct_state_sparse(df_raw: pl.DataFrame, band: float = 0.003,
     )
 
     # synthesize removals for levels alive just before each snapshot but absent
-    removal_frames = []
-    for Ts in snap_times:
-        before = base.filter(pl.col("event_time") < Ts)
-        if before.height == 0:
-            continue
-        alive = (
-            before.sort(["side", "px", "event_time"])
-            .group_by(["side", "px"])
-            .agg(pl.col("qty").sort_by("event_time").last().alias("qv"))
-            .filter(pl.col("qv") > 0)
-            .select(["side", "px"])
-        )
-        in_snap = snaps.filter(pl.col("event_time") == Ts).select(["side", "px"])
-        rem = alive.join(in_snap, on=["side", "px"], how="anti")
-        rem = rem.with_columns([
-            pl.lit(0.0).cast(pl.Float64).alias("qty"),
-            pl.lit(Ts).cast(pl.Int64).alias("event_time"),
-        ])
-        removal_frames.append(rem)
+    removal_frames = _synthesize_removals(base, snaps, snap_times)
     if removal_frames:
         base = pl.concat([base] + removal_frames, how="diagonal")
 

@@ -45,9 +45,8 @@ def collect_days(dest_root: Path, exchange: str):
 
 
 def _merge(files, out: Path) -> None:
-    # bucket 列必存在（每日窄表的绝对分钟时间戳），直接排序保证月份内有序
+    # 每日窄表生成时已对 bucket 排序，且文件按日期升序排列，直接 concat 保证月份内有序
     lf = pl.concat([pl.scan_parquet(f) for f in files], how="vertical_relaxed")
-    lf = lf.sort("bucket")
     lf.sink_parquet(str(out))
 
 
