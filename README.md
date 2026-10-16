@@ -33,9 +33,17 @@ python orderbook/merge_monthly.py --dest-root orderbook/data
 
 ```bash
 # 下载 + 清洗，默认输出 parquet（--format csv 可输出 CSV 便于肉眼检查）
-python binance_vision/download_binance_vision.py --market um --symbol BTCUSDT \
-    --category all --interval 1m --granularity monthly \
-    --start-date 2025-06-01 --end-date 2026-10-15
+# 整月 klines：每个 market×symbol 一个 zip。
+# 注意 monthly 按整月取文件，起止日期中的“日”会被忽略。
+python binance_vision/download_binance_vision.py --market both --symbol all \
+    --category klines --interval 1m --granularity monthly \
+    --start-date 2025-06-01 --end-date 2025-06-30
+
+# 同月 metrics：Binance 只发布日度文件，--granularity monthly 会自动跳过，
+# 需要另跑一条日度命令（6 月 = 每符号 30 个文件）
+python binance_vision/download_binance_vision.py --market um --symbol all \
+    --category metrics --granularity daily \
+    --start-date 2025-06-01 --end-date 2025-06-30
 ```
 
 数据默认落在各模块自己的 `data/` 目录（已在 `.gitignore` 中忽略，不入库）。项目依赖见
