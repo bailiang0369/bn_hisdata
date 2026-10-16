@@ -70,7 +70,7 @@ def main() -> None:
     ap.add_argument("--date", required=True)
     ap.add_argument("--exchange", default="binance_spot")
     ap.add_argument("--band", type=float, default=0.003)
-    ap.add_argument("--mode", choices=["dense", "sparse"], default="dense")
+    ap.add_argument("--mode", choices=["dense", "sparse"], default="sparse")
     ap.add_argument("--dest-root", default=str(HERE / "data"))
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -92,8 +92,8 @@ def main() -> None:
         if (i + 1) % 6 == 0:
             log(f"processed {i + 1}/{len(files)} hours")
 
-    band_all = pl.concat(bands)
-    mid_all = pl.concat(mids)
+    band_all = pl.concat(bands).sort("bucket")
+    mid_all = pl.concat(mids).sort("bucket")
     log(f"total band rows: {band_all.height:,} | total minute rows: {mid_all.height:,}")
 
     # sparse/dense 只是计算时的内存策略，产物（band+mid）schema 与内容一致，
