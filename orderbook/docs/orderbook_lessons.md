@@ -105,6 +105,7 @@ Binance 的 local-depth diff 流在**连接 / 重连**时会重发一份快照�
 ## 6. 输出设计
 
 - 原始按小时分存；处理后**按天合并**成一个 band + 一个 mid 文件（`bucket` 是绝对分钟时间戳，天然带"哪天哪小时"信息，随时可 `bucket//3600000 % 24` 切回某小时）。
+- 每日文件写出前按 `bucket` 排序（band 为 `(bucket, side, px)` 全规范序，mid 为 `bucket`）：单日排序约 1s，却让月度合并免去全局 sort，且有序数据 parquet 压缩率好约 5 倍。
 - band 字段：`bucket`(i64) `side`(str) `px`(**f64**) `q`(**f32**) `mid`(f64)（默认 ±0.3% 内的档位）。
   这个宽度是**有意的取舍**：面向 3/5 分钟超短线事件合约预测，只保留 mid 附近真实可成交的挂单，
   更远的档位没有意义。`--band` 可调，且 `reconstruct_state_sparse` 的预滤窗口由该 band 推导
@@ -168,6 +169,7 @@ Binance 的 local-depth diff 流在**连接 / 重连**时会重发一份快照�
 - 输入：`data/{date}/{exchange}_minute_band.parquet` / `..._minute_band_mid.parquet`
 - 输出：`data/monthly/{exchange}_minute_band_{YYYY-MM}.parquet` / `..._mid_{YYYY-MM}.parquet`
 - 月份由日期文件夹名推导（每日数据天然属于同一 UTC 日历月，不会跨月切割）；月份内按 `bucket` 排序。
+- 有序性来源：每日文件已在 build 阶段按 `bucket` 排好序，日与日 bucket 区间不重叠，按日期顺序 concat 天然有序——**不再做月级全局 sort**（实测 10 天数据全局 sort 占总耗时 ~75%）；遗留的无序每日文件会被自动单独排序后并入。
 - 用 polars 惰性 `concat` + `sink_parquet` 流式写出，单月也不整月入内存（对 Colab/Kaggle 的 12–16GB 友好）。
 
 ```bash
