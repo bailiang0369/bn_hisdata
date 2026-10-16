@@ -10,17 +10,31 @@ Supports
                monthly -> one zip per month (much faster for bulk backfills)
 
 Disk layout (under <module>/data by default):
-  data/{market}/{granularity}/{category}/{symbol}/{interval?}/{symbol}-{type}-{period}.csv
+  data/{market}/{granularity}/{category}/{symbol}/{interval?}/{symbol}-{type}-{period}.{parquet|csv}
   The source .zip is downloaded to the same folder, processed into this cleaned
-  CSV, and then deleted (the zip is only a transient intermediate). Resume is
-  keyed on the cleaned CSV, so re-running is a safe no-op once it exists.
+  parquet (default) or CSV (--format csv), and then deleted (the zip is only a
+  transient intermediate). Resume is keyed on the cleaned output file, so
+  re-running is a safe no-op once it exists.
 
 NOTE: historical Binance CSVs are inconsistent -- some periods have a header
-row, others don't. process() detects this and always emits a clean header
-CSV, then the source .zip is deleted. klines output keeps open_time,
-close_time + OHLCV + count + taker_buy_volume and drops ignore /
-quote_volume / taker_buy_quote_volume. close_time (+1ms) aligns to orderbook
-snapshots (== next candle open_time).
+row, others don't. process() detects this and always emits a clean, typed
+output, then the source .zip is deleted. klines output keeps open_time,
+close_time + OHLC + count + buy_vol/sell_vol and drops volume /
+quote_volume / taker_buy_quote_volume / ignore, where the taker-buy volume
+buy_vol = taker_buy_volume and the taker-sell volume sell_vol = volume -
+taker_buy_volume. close_time (+1ms) aligns to orderbook snapshots
+(== next candle open_time).
+
+Output defaults to parquet rather than CSV: typed columns (no re-parsing
+strings on every read), much smaller on disk (zstd), columnar reads for feature
+building, and consistent with the orderbook module which already emits parquet.
+
+Float columns are float32 by default (--dtype float64 to opt out). At a ~100k
+BTC price float32's ULP is ~0.008, i.e. a relative error of ~4e-8 -- far below
+anything that matters for feature computation -- and it halves those columns.
+Timestamps stay Int64 (ms epoch ~1.7e12 overflows int32). NOTE: do NOT apply
+float32 to the orderbook module's px: above 131072 the ULP (0.0156) exceeds the
+spot tick (0.01) and adjacent price levels would collapse into one value.
 
 Scope decisions (Binance Vision layout):
   - spot -> klines only (spot has no metrics / fundingRate).
@@ -74,13 +88,15 @@ ALL_CATS = ["klines", "metrics"]
 KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume", "close_time",
               "quote_volume", "count", "taker_buy_volume",
               "taker_buy_quote_volume", "ignore"]
-# klines output: keep open_time + close_time + OHLCV + count + taker_buy_volume;
-# drop ignore, quote_volume and taker_buy_quote_volume. close_time (+1ms) is the
-# candle's end instant and the natural join key to orderbook snapshots
-# (close_time + 1 == next candle's open_time). open_time is kept too since it is
-# that same next-candle join key viewed from the preceding bar.
-KLINE_KEEP = ["open_time", "open", "high", "low", "close", "volume",
-              "close_time", "count", "taker_buy_volume"]
+# klines output: keep open_time + close_time + OHLC + count + taker buy/sell
+# volume (buy_vol / sell_vol); drop volume, quote_volume, taker_buy_quote_volume
+# and ignore. 主动买 buy_vol = taker_buy_volume；主动卖 sell_vol = volume -
+# taker_buy_volume。close_time (+1ms) is the candle's end instant and the natural
+# join key to orderbook snapshots (close_time + 1 == next candle's open_time).
+# open_time is kept too since it is that same next-candle join key viewed from
+# the preceding bar.
+KLINE_KEEP = ["open_time", "open", "high", "low", "close", "close_time",
+              "count", "buy_vol", "sell_vol"]
 METRICS_COLS = ["create_time", "symbol", "sum_open_interest",
                 "sum_open_interest_value", "count_toptrader_long_short_ratio",
                 "sum_toptrader_long_short_ratio", "count_long_short_ratio",
@@ -190,14 +206,18 @@ def download_one(url: str, dest: Path, verify: bool, log) -> str:
     return "failed"
 
 
-def process(zip_path: Path, category: str, log) -> None:
-    """Read the zip's CSV, normalize headers, trim klines, write a clean CSV.
+def process(zip_path: Path, category: str, fmt: str, fdtype, log) -> None:
+    """Read the zip's CSV, normalize headers, trim klines, write a typed file.
 
     Binance historical files are inconsistent: some periods ship a header row,
     others don't. We detect this from the first token and always emit a clean,
-    header-bearing CSV next to the .zip (klines trimmed per KLINE_KEEP).
+    typed output next to the .zip (klines trimmed per KLINE_KEEP).
+
+    Streams the inner CSV straight into polars instead of decoding/splitting/
+    re-joining it in Python: monthly aggTrades can be hundreds of MB and the
+    old triple-copy peaked at ~3-4x the CSV size.
     """
-    out = zip_path.with_suffix(".csv")
+    out = zip_path.with_suffix(f".{fmt}")
     if out.exists():
         return
     with zipfile.ZipFile(zip_path) as z:
@@ -223,18 +243,50 @@ def process(zip_path: Path, category: str, log) -> None:
                 df = pl.read_csv(fh, has_header=False,
                                  new_columns=CANONICAL[category])
     if category == "klines":
-        df = df.select(KLINE_KEEP).with_columns([
+        # 主动买成交量 buy_vol = taker_buy_volume；主动卖成交量 sell_vol = 总量 - 主动买。
+        # volume / quote_volume / taker_buy_quote_volume / ignore 一律丢弃。
+        # 时间戳与笔数保持 Int64（毫秒戳 ~1.7e12，int32 会溢出）；价格与成交量用
+        # fdtype（默认 Float32：BTC 价位下 ULP≈0.008、相对误差 ~4e-8，对特征计算无影响）。
+        # 减法在 cast 之前按全精度算，不会先丢精度再相减。
+        df = df.with_columns([
+            pl.col("taker_buy_volume").cast(fdtype).alias("buy_vol"),
+            (pl.col("volume") - pl.col("taker_buy_volume")).cast(fdtype).alias("sell_vol"),
+        ]).select(KLINE_KEEP).with_columns([
             pl.col("open_time").cast(pl.Int64),
-            pl.col("open").cast(pl.Float64),
-            pl.col("high").cast(pl.Float64),
-            pl.col("low").cast(pl.Float64),
-            pl.col("close").cast(pl.Float64),
-            pl.col("volume").cast(pl.Float64),
+            pl.col("open").cast(fdtype),
+            pl.col("high").cast(fdtype),
+            pl.col("low").cast(fdtype),
+            pl.col("close").cast(fdtype),
             pl.col("close_time").cast(pl.Int64),
             pl.col("count").cast(pl.Int64),
-            pl.col("taker_buy_volume").cast(pl.Float64),
+            pl.col("buy_vol").cast(fdtype),
+            pl.col("sell_vol").cast(fdtype),
         ])
-    df.write_csv(str(out))  # 直接落盘，避免先在内存拼出整份 CSV 文本
+    elif category == "aggTrades":
+        df = df.with_columns([
+            pl.col("agg_trade_id").cast(pl.Int64),
+            pl.col("first_trade_id").cast(pl.Int64),
+            pl.col("last_trade_id").cast(pl.Int64),
+            pl.col("transact_time").cast(pl.Int64),
+            pl.col("price").cast(fdtype),
+            pl.col("quantity").cast(fdtype),
+            pl.col("is_buyer_maker").cast(pl.Boolean),  # 1 字节 -> 1 位
+        ])
+    elif category == "metrics":
+        df = df.with_columns([
+            pl.col("create_time").cast(pl.Int64),
+            pl.col("sum_open_interest").cast(fdtype),
+            pl.col("sum_open_interest_value").cast(fdtype),
+            pl.col("count_toptrader_long_short_ratio").cast(fdtype),
+            pl.col("sum_toptrader_long_short_ratio").cast(fdtype),
+            pl.col("count_long_short_ratio").cast(fdtype),
+            pl.col("sum_taker_long_short_vol_ratio").cast(fdtype),
+        ])
+    if fmt == "parquet":
+        # parquet：带类型、zstd 压缩体积更小、列式读取，特征计算更省事
+        df.write_parquet(str(out), compression="zstd")
+    else:
+        df.write_csv(str(out))  # --format csv 时才走这里
     log(f"cleaned -> {out.name}")
 
 
@@ -254,6 +306,11 @@ def main() -> None:
                     help="Local output root (default: <module>/data)")
     ap.add_argument("--no-checksum", action="store_true")
     ap.add_argument("--no-extract", action="store_true")
+    ap.add_argument("--format", choices=["parquet", "csv"], default="parquet",
+                    help="输出格式，默认 parquet（带类型、zstd 压缩更小、列式读取更快）")
+    ap.add_argument("--dtype", choices=["float32", "float64"], default="float32",
+                    help="浮点列精度，默认 float32：BTC 价位下 ULP≈0.008、相对误差 ~4e-8，"
+                         "对特征计算无影响且体积减半；需要逐 tick 精确价位时用 float64")
     args = ap.parse_args()
 
     if args.interval not in VALID_INTERVALS:
@@ -268,6 +325,8 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         ap.error("--start-date must be <= --end-date")
+
+    fdtype = pl.Float32 if args.dtype == "float32" else pl.Float64
 
     def log(tag, msg):
         print(f"[{tag}] {msg}", flush=True)
@@ -290,12 +349,12 @@ def main() -> None:
                                   args.interval, period)
                     dp = dest_path(data_root, market_key, args.granularity, cat,
                                    symbol, args.interval, period)
-                    out = dp.with_suffix(".csv")
-                    # Resume key is the cleaned CSV, not the zip (we delete the
-                    # zip after processing, so a leftover zip means an
+                    out = dp.with_suffix(f".{args.format}")
+                    # Resume key is the cleaned output file, not the zip (we delete
+                    # the zip after processing, so a leftover zip means an
                     # interrupted run, not a finished one).
                     if out.exists():
-                        log(tag, "skip (cleaned csv exists)")
+                        log(tag, f"skip (cleaned .{args.format} exists)")
                         totals["skip"] += 1
                         continue
                     status = download_one(url, dp, not args.no_checksum,
@@ -307,7 +366,7 @@ def main() -> None:
                         totals[status] = totals.get(status, 0) + 1
                         continue
                     try:
-                        process(dp, cat, lambda m: log(tag, m))
+                        process(dp, cat, args.format, fdtype, lambda m: log(tag, m))
                     except Exception as e:  # 坏 zip / 列数不符只影响这一个周期
                         log(tag, f"process FAILED: {e}; removing zip for retry")
                         if dp.exists():

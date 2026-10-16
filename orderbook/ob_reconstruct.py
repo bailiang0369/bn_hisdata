@@ -18,10 +18,17 @@ import polars as pl
 def reconstruct_state(df_raw: pl.DataFrame) -> pl.DataFrame:
     """Return the full per-(side, px, minute-bucket) book state.
 
-    Output columns: side (str), px (f64), bucket (i64, minute-ms), q (f64).
+    Output columns: side (str), px (f64), bucket (i64, minute-ms), q (f32).
     `q` is the resting quantity at the start of each minute bucket (last change
     on/before that bucket), with qty=0/removed levels forward-filled to None
     (filtered out by callers via q>0).
+
+    `q` is deliberately Float32: a resting quantity is not an identifier, and at
+    BTC magnitudes the relative error is ~6e-8 (irrelevant for features), while
+    band is by far the largest table -- this one column is ~1/3 of its size.
+    `px` MUST stay Float64: it identifies a price level (tick 0.01 spot / 0.1
+    futures) and above 131072 float32's ULP (0.0156) exceeds the spot tick, so
+    adjacent levels would collapse into one value and corrupt the book.
     """
     df = df_raw.with_columns([
         pl.col("price").cast(pl.Float64).alias("px"),
@@ -73,7 +80,8 @@ def reconstruct_state(df_raw: pl.DataFrame) -> pl.DataFrame:
     merged = merged.sort(["side", "px", "bucket"]).with_columns(
         pl.col("q").fill_null(strategy="forward").over(["side", "px"])
     )
-    return merged
+    # q -> Float32（省 band 表约 1/3 体积）；px 保持 Float64，原因见函数文档。
+    return merged.with_columns(pl.col("q").cast(pl.Float32))
 
 
 def reconstruct_state_sparse(df_raw: pl.DataFrame, band: float = 0.003,
@@ -164,4 +172,5 @@ def reconstruct_state_sparse(df_raw: pl.DataFrame, band: float = 0.003,
     merged = merged.sort(["side", "px", "bucket"]).with_columns(
         pl.col("q").fill_null(strategy="forward").over(["side", "px"])
     )
-    return merged
+    # 与 dense 版一致：q -> Float32，px 保持 Float64
+    return merged.with_columns(pl.col("q").cast(pl.Float32))

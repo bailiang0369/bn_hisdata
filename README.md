@@ -5,8 +5,10 @@ BTCUSDT 历史数据工程。按数据源与处理逻辑分模块组织：
 - `orderbook/` — L2 订单簿（CryptoHFTData / Binance local-depth diff）。从原始每小时
   snapshot+update 文件重建分钟级定宽（±0.3%）盘口快照。详见
   `orderbook/docs/orderbook_lessons.md`。
-- （规划中）K 线 / aggTrades / metrics — 直接来自官方 `https://data.binance.vision`，
-  处理逻辑与订单簿完全不同，将放在独立模块目录，避免相互耦合。
+- `binance_vision/` — K 线 / aggTrades / metrics，直接来自官方
+  `https://data.binance.vision`。下载并清洗成 parquet（默认）或 CSV：统一表头、
+  klines 拆成主动买/卖成交量（`buy_vol` / `sell_vol`）、校验和校验、按天/按月、
+  断点续传。处理逻辑与订单簿完全不同，故独立成模块。
 
 ## orderbook 模块
 
@@ -27,5 +29,14 @@ python orderbook/validate_snapshot_consistency.py --date 2026-10-12 --exchange b
 python orderbook/merge_monthly.py --dest-root orderbook/data
 ```
 
-数据默认落在 `orderbook/data/`（已在 `.gitignore` 中忽略，不入库）。项目依赖见
+## binance_vision 模块
+
+```bash
+# 下载 + 清洗，默认输出 parquet（--format csv 可输出 CSV 便于肉眼检查）
+python binance_vision/download_binance_vision.py --market um --symbol BTCUSDT \
+    --category all --interval 1m --granularity monthly \
+    --start-date 2025-06-01 --end-date 2026-10-15
+```
+
+数据默认落在各模块自己的 `data/` 目录（已在 `.gitignore` 中忽略，不入库）。项目依赖见
 根目录 `requirements.txt`（`polars`、`zstandard`）。
