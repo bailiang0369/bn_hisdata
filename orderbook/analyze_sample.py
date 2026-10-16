@@ -4,12 +4,18 @@ import zstandard as zstd
 import pandas as pd
 import pyarrow.parquet as pq
 
-path = "data/sample_hour.parquet"
+path = "data/sample_hour.parquet.zst"
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
-# zstd 解压 -> parquet
+# 依魔数决定是否解压：.zst 样本流式解压，裸 parquet 直接读
+# （stream_reader 对非 zstd 输入会抛 ZstdError，不能无条件解压）
 raw_bytes = open(path, "rb").read()
-raw = zstd.ZstdDecompressor().stream_reader(io.BytesIO(raw_bytes)).read()
-print(f"compressed: {len(raw_bytes):,} bytes -> decompressed: {len(raw):,} bytes")
+if raw_bytes[:4] == ZSTD_MAGIC:
+    raw = zstd.ZstdDecompressor().stream_reader(io.BytesIO(raw_bytes)).read()
+    print(f"compressed: {len(raw_bytes):,} bytes -> decompressed: {len(raw):,} bytes")
+else:
+    raw = raw_bytes
+    print(f"plain parquet: {len(raw):,} bytes (no decompression)")
 
 table = pq.read_table(io.BytesIO(raw))
 print("\n===== Arrow Schema =====")

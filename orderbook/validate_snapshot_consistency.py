@@ -85,6 +85,12 @@ def main() -> None:
 
     root = Path(args.dest_root) / args.date / args.exchange
     files = sorted(root.glob("*/BTCUSDT_orderbook.parquet"))
+    if len(files) < 2:
+        # 至少需要 2 个小时文件才能形成一个可校验的跨小时边界；否则 n<=0，
+        # 循环空跑并打印 "OVERALL 0.00%"，会被误读成"重建全错"。
+        print(f"ERROR: need >=2 hour files under {root}, found {len(files)}; "
+              f"nothing to validate", file=sys.stderr)
+        raise SystemExit(3)
     n = len(files) - 1  # boundaries H=0..n-1 vs H+1 snapshot
 
     tot = {"matched": 0, "diff": 0, "only_ours": 0, "only_truth": 0}

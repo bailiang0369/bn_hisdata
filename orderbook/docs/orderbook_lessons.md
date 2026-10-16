@@ -93,9 +93,11 @@ Binance 的 local-depth diff 流在**连接 / 重连**时会重发一份快照�
   - `download_day.py`：匿名 CryptoHFTData API，顺序、每小时 sleep 1.5s，**慢**，一次一个市场。
   - `download_orderbook_s3.py`：Cloudflare **R2 直连**，线程池 32 workers，**快**，一次下两个市场，需要环境变量 `CHD_API_KEY`。批处理 400 天务必用 R2。
 - **zst 文件归一化（关键）**：`2026-08-19` 前的文件是 `.parquet.zst`。
-  - 匿名 API 下载器保留**原始 zst 字节**；
-  - R2 下载器在流里**解压了但把文件名仍写成 `.parquet.zst`**（内容是已解压的 parquet，magic 不在）。
-  - 不论哪种，build 只认 `.parquet`，所以 pipeline 必须**按 magic 嗅探**、统一重写成真正的 `.parquet`（见 `pipeline.normalize_raw`）。否则 2025-06 ~ 2026-08 的海量历史文件全读不出来。
+  - 两个下载器（匿名 API 的 `download_day.py` 与 R2 直连的 `download_orderbook_s3.py`）都会在下载时**就地解压**，
+    落盘统一写成无压缩的 `.parquet`（文件名与内容一致，下游无需按扩展名嗅探魔数）；
+    两者都用**流式解压**（`zstandard` 的 `stream_reader` / `stream_writer`），可兼容任意 zstd 帧（不依赖帧头内嵌的 content size）。
+  - 早期（含已修正前）的 `download_day.py` 曾用一次性 `ZstdDecompressor().decompress()`，对无 content size 的帧会抛 `ZstdError` 中断整天——已改为流式。
+  - 不论哪种后端，build 只认 `.parquet`，`pipeline.normalize_raw` 仍按 magic 嗅探、把残留的 `.parquet.zst` 重写为 `.parquet`。否则 2025-06 ~ 2026-08 的海量历史文件全读不出来。
 - 大文件（合约单小时 ~17MB）在限速出口下可能 >60s，需大超时（R2 客户端已设 1800s）。
 
 ---

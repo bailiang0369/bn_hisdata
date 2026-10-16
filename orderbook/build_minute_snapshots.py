@@ -96,9 +96,11 @@ def main() -> None:
     mid_all = pl.concat(mids)
     log(f"total band rows: {band_all.height:,} | total minute rows: {mid_all.height:,}")
 
-    suffix = "_sparse" if args.mode == "sparse" else ""
+    # sparse/dense 只是计算时的内存策略，产物（band+mid）schema 与内容一致，
+    # 因此统一写成 {exchange}_minute_band.parquet，与 pipeline / merge_monthly 对齐，
+    # 避免 sparse 产物因多带 _sparse 后缀而不被识别、无法续跑/聚合。
     out = args.out or str(
-        Path(args.dest_root) / args.date / f"{args.exchange}_minute_band{suffix}.parquet"
+        Path(args.dest_root) / args.date / f"{args.exchange}_minute_band.parquet"
     )
     band_all.write_parquet(out)
     mid_all.write_parquet(out.replace(".parquet", "_mid.parquet"))

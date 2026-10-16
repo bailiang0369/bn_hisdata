@@ -126,6 +126,12 @@ def main() -> int:
         return 2
 
     date = args.date
+    try:
+        # 严格 YYYY-MM-DD；提前校验，避免非法日期先打一次凭证请求再抛 traceback。
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        print(f"invalid --date {date!r}; expected YYYY-MM-DD (UTC)", file=sys.stderr)
+        return 2
     creds = get_credentials(api_key, timeout=90, retries=5)
     bucket = creds["bucket"]
 
@@ -145,12 +151,14 @@ def main() -> int:
 
     client = build_client(creds)
 
-    # R2 短期凭证可能在大批量/慢网下过期。worker 遇到鉴权错误时加锁刷新一次，
-    # 由首个命中过期的线程执行，其余线程复用新凭证，避免重复关闭正在使用的 client。
+    # R2 短期凭证可能在大批量/慢网下过期。只有"令牌过期/失效"类错误刷新凭证才有意义；
+    # AccessDenied / InvalidAccessKeyId / SignatureDoesNotMatch 说明 API key 本身有问题
+    # （写错、被吊销、签名不匹配），刷新只会拿到同样无效的凭证，且在多线程下会触发
+    # 重复的凭证拉取风暴，因此这些错误直接判失败、不刷新。
     cred_state = {"client": client, "gen": 0}
     cred_lock = threading.Lock()
-    AUTH_CODES = {"ExpiredToken", "InvalidToken", "AccessDenied",
-                  "SignatureDoesNotMatch", "InvalidAccessKeyId"}
+    retired_clients: list = []  # 被换下的旧 client，统一在线程池结束后关闭
+    TOKEN_EXPIRY_CODES = {"ExpiredToken", "InvalidToken"}
 
     def refresh_credentials(expected_gen: int) -> None:
         with cred_lock:
@@ -161,12 +169,15 @@ def main() -> int:
             old = cred_state["client"]
             cred_state["client"] = new_client
             cred_state["gen"] += 1
-            old.close()
+            # 不立即 close：此刻其他线程可能仍在旧 client 的连接上跑在途请求，
+            # 立即关闭会把这些请求打断成 err。延后到线程池全部结束再统一关闭。
+            retired_clients.append(old)
 
-    def _is_auth_error(exc: S3LiteError) -> bool:
+    def _is_token_expired(exc: S3LiteError) -> bool:
+        # R2/S3 对过期临时凭证会返回带 <Code>ExpiredToken</Code> 的错误体；
+        # s3lite.parse_error_response 已兼容有/无命名空间两种形态，能拿到真实错误码。
         code = exc.response.get("Error", {}).get("Code", "")
-        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        return code in AUTH_CODES or status == 403
+        return code in TOKEN_EXPIRY_CODES
 
     root = Path(args.dest_root) / date
     hours = args.hours if args.hours is not None else list(range(24))
@@ -196,7 +207,7 @@ def main() -> int:
                     status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
                     if code in ("NoSuchKey", "404", "NotFound") or status == 404:
                         break  # 该拼写不存在 -> 尝试另一个后缀，或最后报 miss
-                    if _is_auth_error(exc) and not refreshed:
+                    if _is_token_expired(exc) and not refreshed:
                         refreshed = True
                         # refresh_credentials 内部按 gen 幂等：若别的线程已刷新则为空操作，
                         # 随后用当前（已是最新）client 重试，避免过期瞬间整批误报 err。
@@ -216,7 +227,9 @@ def main() -> int:
                 expected = resp.get("ContentLength", 0) or 0
                 if expected and size != expected:
                     return (label, f"err:size {size}!={expected}", 0)
-                return (label, "ok", size)
+                # 日志里上报"落盘后实际文件大小"（解压后），而非线上的压缩字节数，
+                # 避免把解压文件的真实体积误报成压缩体积。
+                return (label, "ok", dest.stat().st_size)
         return (label, "404", 0)
 
     def _iter_body(body):
@@ -226,7 +239,7 @@ def main() -> int:
                 return
             yield chunk
 
-    ok = miss = skip = 0
+    ok = miss = skip = err = 0
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(worker, ex, h): (ex, h) for ex, h in jobs}
@@ -241,11 +254,18 @@ def main() -> int:
                 miss += 1
                 print(f"404  {label}")
             else:
+                err += 1
                 print(f"ERR  {label}: {status}", file=sys.stderr)
+    # 线程池已全部结束（无在途请求），此时关闭当前 client 与被换下的旧 client 都安全。
     cred_state["client"].close()
+    for old in retired_clients:
+        old.close()
 
     dt = time.time() - t0
-    print(f"\nDone in {dt:.1f}s: {ok} downloaded, {skip} present, {miss} missing for {date}")
+    print(f"\nDone in {dt:.1f}s: {ok} downloaded, {skip} present, {miss} missing, "
+          f"{err} errored for {date}")
+    if err:
+        return 1
     return 0
 
 

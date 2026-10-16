@@ -27,8 +27,6 @@ import polars as pl
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 EXCHANGES = ["binance_futures", "binance_spot"]
-SYMBOL = "BTCUSDT"
-DATA_TYPE = "orderbook"
 
 
 def collect_days(dest_root: Path, exchange: str):
@@ -37,8 +35,8 @@ def collect_days(dest_root: Path, exchange: str):
     for d in sorted(dest_root.iterdir()):
         if not d.is_dir() or not DATE_RE.match(d.name):
             continue
-        b = d / f"{exchange}_{DATA_TYPE}_minute_band.parquet"
-        m = d / f"{exchange}_{DATA_TYPE}_minute_band_mid.parquet"
+        b = d / f"{exchange}_minute_band.parquet"
+        m = d / f"{exchange}_minute_band_mid.parquet"
         if b.exists():
             band.append((d.name, b))
         if m.exists():
@@ -81,8 +79,8 @@ def main() -> None:
             groups.setdefault(name[:7], [[], []])[1].append(f)
 
         for ym, (b_files, m_files) in sorted(groups.items()):
-            band_out = out_dir / f"{exchange}_{DATA_TYPE}_minute_band_{ym}.parquet"
-            mid_out = out_dir / f"{exchange}_{DATA_TYPE}_minute_band_mid_{ym}.parquet"
+            band_out = out_dir / f"{exchange}_minute_band_{ym}.parquet"
+            mid_out = out_dir / f"{exchange}_minute_band_mid_{ym}.parquet"
             rebuild = args.force or (not band_out.exists()) or (not mid_out.exists())
             if not rebuild:
                 print(f"[skip] {exchange} {ym}: 月份文件已存在")
