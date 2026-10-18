@@ -158,7 +158,7 @@ def main() -> int:
     cred_state = {"client": client, "gen": 0}
     cred_lock = threading.Lock()
     retired_clients: list = []  # 被换下的旧 client，统一在线程池结束后关闭
-    TOKEN_EXPIRY_CODES = {"ExpiredToken", "InvalidToken"}
+    TOKEN_EXPIRY_CODES = {"ExpiredToken", "InvalidToken", "RequestTimeTooSkewed"}
 
     def refresh_credentials(expected_gen: int) -> None:
         with cred_lock:
