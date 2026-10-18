@@ -12,6 +12,10 @@ Features:
 import gc
 import json
 import os
+
+# Prevent thread contention between Polars and Python ProcessPoolExecutor
+os.environ["POLARS_MAX_THREADS"] = "1"
+
 import shutil
 import subprocess
 import sys
