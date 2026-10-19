@@ -1,27 +1,17 @@
 """
 Batch runner for full historical orderbook data processing (2025-07 through 2026-10).
 
-Iterates through each month sequentially, calling the 4-worker multiprocessing daily pipeline
-with `--mode sparse` and `--download r2`. After each month completes, `merge_monthly.py`
-aggregates daily parquet files into monthly parquet files under `data/monthly/` and deletes
-intermediate daily files (`--delete-daily`).
-
-Progress and detailed monthly benchmark metrics are saved continuously to
-`orderbook/docs/full_historical_batch_summary.json` and
-`orderbook/docs/full_historical_batch_summary.md`.
+Processes days sequentially in a single process to allow Polars to fully utilize all
+available CPU cores via internal multi-threading, avoiding inter-process overhead.
 """
 
 import gc
 import json
 import os
-
-os.environ["POLARS_MAX_THREADS"] = "1"
-
 import shutil
 import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -58,9 +48,8 @@ def run_cmd(args: list[str]) -> tuple[int, float]:
     return rc, time.time() - t0
 
 
-def process_day_worker(args_tuple) -> dict:
-    date_str, dest_root, band, mode = args_tuple
-    print(f"\n===== [FAST POLARS PIPELINE] Processing Day: {date_str} (mode={mode}) =====", flush=True)
+def process_day(date_str: str, dest_root: str, band: float, mode: str) -> dict:
+    print(f"\n===== [POLARS MULTI-THREAD PIPELINE] Processing Day: {date_str} (mode={mode}) =====", flush=True)
     t_day_start = time.time()
 
     last_err = None
@@ -146,7 +135,7 @@ def save_batch_summary(monthly_results: list[dict], all_months: list[str]):
     SUMMARY_JSON_PATH.write_text(json.dumps(summary_data, indent=2), encoding="utf-8")
 
     md_lines = [
-        "# 优化后全量历史 Orderbook 数据批量处理统计报告",
+        "# 单进程 Polars 多线程 Orderbook 数据批量处理统计报告",
         "",
         f"- **目标月份区间**：2025-07 ~ 2026-10 (共 {len(all_months)} 个月份)",
         f"- **已完成月份数**：{len(monthly_results)} / {len(all_months)}",
@@ -200,10 +189,8 @@ def main():
 
     completed_months = {mr["month"] for mr in monthly_results}
 
-    workers = min(4, os.cpu_count() or 4)
-
-    print(f"===== [OPTIMIZED POLARS BATCH] Target Months: {all_month_strs} =====")
-    print(f"Parallel Workers per month: {workers} | Snapshot Mode: sparse")
+    print(f"===== [POLARS MULTI-THREAD BATCH] Target Months: {all_month_strs} =====")
+    print("Mode: sparse | Execution: Single process sequential (Polars multi-threaded)")
 
     for y, m, ym_str in target_months:
         spot_band = DATA / "monthly" / f"binance_spot_minute_band_{ym_str}.parquet"
@@ -223,22 +210,13 @@ def main():
         t_month_start = time.time()
         daily_metrics = []
 
-        tasks = [(d, dest_root, 0.003, "sparse") for d in days]
-
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(process_day_worker, task): task[0] for task in tasks}
-            for future in as_completed(futures):
-                date_str = futures[future]
-                try:
-                    res = future.result()
-                    daily_metrics.append(res)
-                except Exception as exc:
-                    print(f"Day {date_str} in month {ym_str} failed: {exc}", file=sys.stderr)
-                    raise exc
+        for d in days:
+            res = process_day(d, dest_root, band=0.003, mode="sparse")
+            daily_metrics.append(res)
 
         daily_metrics.sort(key=lambda x: x["date"])
 
-        print(f"\n===== [FAST POLARS PIPELINE] Merging Monthly Parquet for {ym_str} =====", flush=True)
+        print(f"\n===== [POLARS MULTI-THREAD BATCH] Merging Monthly Parquet for {ym_str} =====", flush=True)
         m_args = [
             sys.executable, "merge_monthly.py",
             "--dest-root", dest_root,
@@ -269,9 +247,9 @@ def main():
         monthly_results.sort(key=lambda x: x["month"])
 
         save_batch_summary(monthly_results, all_month_strs)
-        print(f"===== [FAST POLARS PIPELINE] Month {ym_str} DONE in {t_month_wall/60:.2f} minutes =====", flush=True)
+        print(f"===== [POLARS MULTI-THREAD BATCH] Month {ym_str} DONE in {t_month_wall/60:.2f} minutes =====", flush=True)
 
-    print("\n[OPTIMIZED POLARS BATCH] ALL TARGET MONTHS PROCESSED SUCCESSFULLY!", flush=True)
+    print("\n[POLARS MULTI-THREAD BATCH] ALL TARGET MONTHS PROCESSED SUCCESSFULLY!", flush=True)
 
 
 if __name__ == "__main__":
