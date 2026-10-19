@@ -15,7 +15,6 @@ import gc
 import json
 import os
 
-# Prevent thread contention between Polars and Python ProcessPoolExecutor
 os.environ["POLARS_MAX_THREADS"] = "1"
 
 import shutil
@@ -61,7 +60,7 @@ def run_cmd(args: list[str]) -> tuple[int, float]:
 
 def process_day_worker(args_tuple) -> dict:
     date_str, dest_root, band, mode = args_tuple
-    print(f"\n===== [BATCH PIPELINE] Processing Day: {date_str} (mode={mode}) =====", flush=True)
+    print(f"\n===== [FAST POLARS PIPELINE] Processing Day: {date_str} (mode={mode}) =====", flush=True)
     t_day_start = time.time()
 
     last_err = None
@@ -128,7 +127,6 @@ def get_month_days(year: int, month: int) -> list[str]:
     else:
         e = date(year, month + 1, 1) - timedelta(days=1)
 
-    # Cap at latest available date in datasets (2026-10-12)
     latest = date(2026, 10, 12)
     if e > latest:
         e = latest
@@ -147,9 +145,8 @@ def save_batch_summary(monthly_results: list[dict], all_months: list[str]):
     SUMMARY_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
     SUMMARY_JSON_PATH.write_text(json.dumps(summary_data, indent=2), encoding="utf-8")
 
-    # Markdown doc
     md_lines = [
-        "# 全量历史 Orderbook 数据批量处理进展与统计报告",
+        "# 优化后全量历史 Orderbook 数据批量处理统计报告",
         "",
         f"- **目标月份区间**：2025-07 ~ 2026-10 (共 {len(all_months)} 个月份)",
         f"- **已完成月份数**：{len(monthly_results)} / {len(all_months)}",
@@ -168,7 +165,6 @@ def save_batch_summary(monthly_results: list[dict], all_months: list[str]):
         avg_bld = mr["avg_daily_build_sec"]
         md_lines.append(f"| {ym} | {days_cnt} 天 | {tot_m:.2f} m | {avg_dl:.2f} s | {avg_bld:.2f} s | 已完成 |")
 
-    # Monthly Parquet status
     monthly_dir = DATA / "monthly"
     md_lines.extend(["", "## 已生成的月度 Parquet 产物文件列表", ""])
     if monthly_dir.exists():
@@ -186,18 +182,14 @@ def main():
 
     dest_root = str(DATA)
 
-    # Define target months: 2025-07 through 2026-10
     target_months = []
-    # 2025: 07..12
     for m in range(7, 13):
         target_months.append((2025, m, f"2025-{m:02d}"))
-    # 2026: 01..10
     for m in range(1, 11):
         target_months.append((2026, m, f"2026-{m:02d}"))
 
     all_month_strs = [m[2] for m in target_months]
 
-    # Load existing progress if available
     monthly_results = []
     if SUMMARY_JSON_PATH.exists():
         try:
@@ -210,11 +202,10 @@ def main():
 
     workers = min(4, os.cpu_count() or 4)
 
-    print(f"===== [FULL HISTORICAL BATCH] Target Months: {all_month_strs} =====")
+    print(f"===== [OPTIMIZED POLARS BATCH] Target Months: {all_month_strs} =====")
     print(f"Parallel Workers per month: {workers} | Snapshot Mode: sparse")
 
     for y, m, ym_str in target_months:
-        # Check if monthly parquet already exists and fully merged
         spot_band = DATA / "monthly" / f"binance_spot_minute_band_{ym_str}.parquet"
         futures_band = DATA / "monthly" / f"binance_futures_minute_band_{ym_str}.parquet"
         if ym_str in completed_months and spot_band.exists() and futures_band.exists():
@@ -247,8 +238,7 @@ def main():
 
         daily_metrics.sort(key=lambda x: x["date"])
 
-        # Monthly Merge
-        print(f"\n===== [BATCH PIPELINE] Merging Monthly Parquet for {ym_str} =====", flush=True)
+        print(f"\n===== [FAST POLARS PIPELINE] Merging Monthly Parquet for {ym_str} =====", flush=True)
         m_args = [
             sys.executable, "merge_monthly.py",
             "--dest-root", dest_root,
@@ -279,9 +269,9 @@ def main():
         monthly_results.sort(key=lambda x: x["month"])
 
         save_batch_summary(monthly_results, all_month_strs)
-        print(f"===== [BATCH PIPELINE] Month {ym_str} DONE in {t_month_wall/60:.2f} minutes =====", flush=True)
+        print(f"===== [FAST POLARS PIPELINE] Month {ym_str} DONE in {t_month_wall/60:.2f} minutes =====", flush=True)
 
-    print("\n[FULL HISTORICAL BATCH] ALL TARGET MONTHS PROCESSED SUCCESSFULLY!", flush=True)
+    print("\n[OPTIMIZED POLARS BATCH] ALL TARGET MONTHS PROCESSED SUCCESSFULLY!", flush=True)
 
 
 if __name__ == "__main__":
