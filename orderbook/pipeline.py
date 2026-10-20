@@ -54,6 +54,11 @@ def normalize_raw(raw_dir: Path) -> None:
     stream but keeps the .zst name (so the file is misnamed parquet bytes); the
     anonymous API downloader keeps the raw zst bytes. Normalize by sniffing the
     magic number, then writing a proper .parquet next to it.
+
+    流式解压 + .part 原子改名（2026-10-20）：旧实现 read_bytes() 整个文件再
+    write_bytes()，解压后单文件 ~100MB，瞬时 2-3 倍内存；已是裸 parquet 只是
+    名字带 .zst 的直接 rename，零拷贝。两个下载器现在下载时即解压，本函数
+    只剩历史遗留文件兜底的价值。
     """
     for f in raw_dir.rglob("*"):
         if not f.is_file():
@@ -61,11 +66,21 @@ def normalize_raw(raw_dir: Path) -> None:
         name = f.name
         if not (name.endswith(".parquet.zst") or name.endswith(".zst")):
             continue
-        data = f.read_bytes()
-        if data[:4] == ZSTD_MAGIC:
-            data = zstd.ZstdDecompressor().decompress(data)
         out = f.with_name(name.replace(".zst", ""))  # -> BTCUSDT_orderbook.parquet
-        out.write_bytes(data)
+        with f.open("rb") as fh:
+            magic = fh.read(4)
+        if magic != ZSTD_MAGIC:
+            # 内容已是裸 parquet，只是名字带 .zst：改名即可，无需拷贝
+            f.replace(out)
+            continue
+        tmp = out.with_name(out.name + ".part")
+        try:
+            with f.open("rb") as src, tmp.open("wb") as dst:
+                zstd.ZstdDecompressor().copy_stream(src, dst)
+            tmp.replace(out)  # 原子：out 上只会出现完整文件
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         f.unlink()
 
 

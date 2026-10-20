@@ -14,6 +14,7 @@ Usage:
     python validate_snapshot_consistency.py --date 2026-10-12 --exchange binance_spot
 """
 import argparse
+import sys
 from pathlib import Path
 
 import polars as pl
@@ -97,9 +98,19 @@ def main() -> None:
     print(f"{'H':>2}  {'ours':>6} {'truth':>6} {'match':>6} {'diff':>5} "
           f"{'onlyO':>5} {'onlyT':>5} {'match%':>6}")
     for h in range(n):
-        last_ev = pl.read_parquet(files[h])["event_time"].max()
+        # 只取 event_time 最大值：scan + 投影下推，避免为一个小标量读入整个
+        # 小时文件（~20MB / ~140 万行）。
+        last_ev = pl.scan_parquet(files[h]).select(
+            pl.col("event_time").max()
+        ).collect()["event_time"][0]
         ours, mid = reconstruct_last_minute(files[h])
         truth = load_raw_snapshot(files[h + 1], last_ev)
+        if truth.height == 0:
+            # 该小时文件里没有 event_time 精确等于边界的快照。不打印 0.00%
+            # ——那看起来像"重建全错"，实际只是这个边界无法校验，跳过它。
+            print(f"{h:>2}  WARNING: no snapshot at event_time == {last_ev} in "
+                  f"{files[h + 1].name}; boundary SKIPPED (not a 0% match)")
+            continue
         r = compare(ours, truth, mid, args.band)
         denom = r["matched"] + r["diff"] + r["only_ours"] + r["only_truth"]
         pct = 100.0 * r["matched"] / denom if denom else 0.0

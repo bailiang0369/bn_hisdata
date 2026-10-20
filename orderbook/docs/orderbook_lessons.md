@@ -188,3 +188,47 @@ python orderbook/merge_monthly.py --dest-root orderbook/data --exchange binance_
 
 > 断点续传：月度文件已存在则跳过整月；若某个月是分多段补下的，补完后再跑一次
 > `merge_monthly.py --force` 重建受影响月份，否则已存在的月份会被跳过、漏掉新增的天。
+
+---
+
+## 10. sparse 预滤窗口：从"快照 mid ± 2%"到可证明安全的按桶窗口（2026-10-20 修复）
+
+**Bug**：`reconstruct_state_sparse` 原来的预滤窗口由**快照 mid** 加 2% margin 推导
+（`margin = max(0.02*mid, 0.05*span)`）。快照只在小时初（和重连时）出现，mid 一小时
+内的真实摆动可以远超 2%（BTC 每月数次）。一旦超出，band 内的档位在 as-of **之前**
+就被裁掉：受影响分钟的 band 行整段消失、mid 为 null，**且不报错**。dense 是默认
+模式所以主链路没中招，`--mode sparse` 是静默丢数据的陷阱。
+
+**修复（可证明安全 + 按桶推导）**：窗口改为 `[(1-band)*mid_lo, (1+band)*mid_hi]`，
+其中每个分钟桶 b 的界来自**治理该桶的消息**——桶末状态就是桶内最后一条消息后的状态
+（桶内没有更晚消息），该消息的 max touched bid 是彼时的存活档位，故
+`mid(b) ∈ [tb_b, ta_b]`，band 档位必在 `[(1-band)*tb_b, (1+band)*ta_b]` 内，
+再对所有桶取 min/max 得到覆盖区间。**无条件成立，无需调 margin。**
+
+**为什么必须按桶而不是全文件 min/max**：本数据源实测存在**垃圾价位**（BTC ~84k 的
+盘口里出现 560 / 33.7k / 174 万的报价）。全文件取界会被一条野值消息拖垮——真实小时
+文件级窗口 `[33.7k, 101.4k]`，只滤掉 2.3% 的网格行；按桶取界（野值几乎不可能恰好
+是某分钟的末条消息）窗口 `[75.6k, 85.4k]`，滤掉 34%–54%。
+
+**真实数据验证**（2026-10-12 futures，07 = 含 2 个快照的重连文件）：
+
+| 文件 | 网格行 dense → sparse | band/mid | 耗时 dense → sparse |
+|---|---|---|---|
+| hour 07（2 快照） | 4,971,927 → 3,277,957（65.9%） | 完全一致 | 27.1s → 21.6s |
+| hour 13（1 快照） | 4,800,029 → 2,224,609（46.3%） | 完全一致 | 16.7s → 13.1s |
+
+修复前 sparse 比 dense 还慢（白算一遍窗口），修复后真正省内存且更快。
+
+**已知边界（caveat）**：若治理消息之后还有消息**删掉了顶档**，best bid 可能跌到
+tb_b 之下（下一存活档位是更老的消息设置的），此时该分钟的界不再覆盖 best bid/ask，
+mid 会算错。连续报价的盘口（BTCUSDT）每隔几条消息就会重触顶档，实测未出现；
+dense 模式无此 caveat。回归测试 `test_sparse_never_clips_band_levels_on_big_mid_swing`
+（mid 摆动 10%）与 `test_sparse_ignores_non_final_wild_prices`（野值在非末条消息）
+锁定已验证的场景。
+
+**同时重构**：`reconstruct_state` / `reconstruct_state_sparse` 共享
+`_prepare_base + _grid_and_fill`，快照移除逻辑只剩一份——此前两份拷贝正是 §1 那个
+bug 长期存活的原因（修复只落在其中一份上）。另外 `build_minute_snapshots.process_hour`
+的 mid 表改为显式 `sort("bucket")`（full join 不保证行序，不排序则 dense/sparse 的
+逐小时产物行序可能不同），局部变量 `band` 重命名为 `band_df`（原先遮蔽 float 参数，
+纯属 RHS 先求值才侥幸正确）。

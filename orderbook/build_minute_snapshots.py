@@ -56,16 +56,21 @@ def process_hour(path: Path, band: float, mode: str = "dense"):
         ((pl.col("best_bid") + pl.col("best_ask")) / 2).alias("mid"),
         (pl.col("best_ask") - pl.col("best_bid")).alias("spread"),
     ).filter(pl.col("best_bid").is_not_null() & pl.col("best_ask").is_not_null())
+    # 显式按 bucket 排序：full join 不保证行序，不排序则同一份数据在
+    # dense/sparse 下的逐小时产物行序可能不同（下游 equals / 字节级对比会炸）。
+    mb = mb.sort("bucket")
 
     # clip to the fixed-% band around mid
+    # 注意：局部变量叫 band_df，不要叫 band——那会遮蔽 float 参数 band，
+    # 该行虽因 RHS 先求值而侥幸正确，任何人在此附近加代码都会静默出错。
     st = merged.join(mb.select(["bucket", "mid"]), on="bucket", how="left")
-    band = st.filter(
+    band_df = st.filter(
         (pl.col("q") > 0)
         & (pl.col("px") >= pl.col("mid") * (1 - band))
         & (pl.col("px") <= pl.col("mid") * (1 + band))
     ).select(["bucket", "side", "px", "q", "mid"])
 
-    return band, mb
+    return band_df, mb
 
 
 def main() -> None:
