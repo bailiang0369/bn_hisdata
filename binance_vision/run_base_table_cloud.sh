@@ -21,10 +21,16 @@ set -euo pipefail
 WORK_DIR="${WORK_DIR:-/mnt/workspace}"
 REPO_DIR="$WORK_DIR/bn_hisdata"
 
-START=2025-06-01                 # 与 orderbook 窗口对齐
-KLINES_MONTHLY_END=2026-09-30    # monthly 按整月取文件：10 月未完结，文件还不存在
-DAILY_END=2026-10-19             # 日度部分补到昨天
-JOBS=8                           # 并发数；Binance Vision 限流时调小
+# 日期默认值（均可用环境变量覆盖，便于被 run_all_cloud.sh 编排复用）：
+#   START              与 orderbook 窗口对齐
+#   KLINES_MONTHLY_END 最后一个完整月的月末——monthly 按整月取文件，当月未
+#                      完结 Binance 还没有当月月度文件
+#   DAILY_START/END    当月日度部分（补未完结的月份），默认 当月1号 ~ 昨天
+START="${START:-2025-06-01}"
+KLINES_MONTHLY_END="${KLINES_MONTHLY_END:-$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%F)}"
+DAILY_START="${DAILY_START:-$(date -u +%Y-%m-01)}"
+DAILY_END="${DAILY_END:-$(date -u -d '1 day ago' +%F)}"
+JOBS="${JOBS:-8}"                   # 并发数；Binance Vision 限流时调小
 
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
@@ -57,10 +63,10 @@ python binance_vision/download_binance_vision.py --market both --symbol all \
     --category klines --interval 1m --granularity monthly \
     --start-date "$START" --end-date "$KLINES_MONTHLY_END" -j "$JOBS"
 
-# ---- klines 日度（补 2026-10 未完结部分）--------------------------------------
+# ---- klines 日度（补当月未完结部分）------------------------------------------
 python binance_vision/download_binance_vision.py --market both --symbol all \
     --category klines --interval 1m --granularity daily \
-    --start-date 2026-10-01 --end-date "$DAILY_END" -j "$JOBS"
+    --start-date "$DAILY_START" --end-date "$DAILY_END" -j "$JOBS"
 
 # ---- metrics 日度（仅 um；spot 无 metrics，会自动跳过）-------------------------
 python binance_vision/download_binance_vision.py --market um --symbol all \

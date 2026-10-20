@@ -10,6 +10,29 @@ BTCUSDT 历史数据工程。按数据源与处理逻辑分模块组织：
   klines 拆成主动买/卖成交量（`buy_vol` / `sell_vol`）、校验和校验、按天/按月、
   断点续传。处理逻辑与订单簿完全不同，故独立成模块。
 
+## 全链路一键（推荐）
+
+`run_all_cloud.sh` 串起两个模块的完整下载与处理，每步断点续传，中断后重跑同一条
+命令即可：
+
+```bash
+git clone https://github.com/bailiang0369/bn_hisdata.git /mnt/workspace/bn_hisdata
+cd /mnt/workspace/bn_hisdata
+tmux new -s data
+CHD_API_KEY=xxx bash run_all_cloud.sh 2>&1 | tee run_all.log
+```
+
+步骤：① vision klines+metrics+基础宽表 → ② vision aggTrades+master 宽表 →
+③ orderbook R2 下载+分钟快照（按天，原始即删）→ ④ orderbook 月度聚合。
+可用 `SKIP_VISION=1` / `SKIP_ORDERBOOK=1` 只跑一半；`START/END/JOBS/LEAN`
+环境变量可覆盖（默认窗口 `2025-06-01 ~ 昨天`）。
+
+**必须在不会因闲置被回收的机器上跑**：魔搭 DSW 空闲约 1 小时就收实例，过夜没人
+盯着不行；Jules 之类的一次性云 VM 也不行（任务结束 VM 即销毁，产出只能走 git
+分支带回，10GB+ 的 parquet 不可能这么搬）。用按量付费的持久小机器
+（AutoDL / 智星云 / ECS，系统盘 40GB+ 足够：原始按天删，峰值只压当天数据，
+最终产物 ~10GB）。时长参考（~490 天窗口）：vision 1–3h，orderbook 两市场 12–24h。
+
 ## orderbook 模块
 
 运行方式（从仓库根目录）：

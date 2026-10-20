@@ -20,9 +20,16 @@ set -euo pipefail
 WORK_DIR="${WORK_DIR:-/mnt/workspace}"
 REPO_DIR="$WORK_DIR/bn_hisdata"
 START="${START:-2025-06-01}"     # 与 orderbook / klines 窗口对齐
-END="${END:-2026-10-19}"         # 日度 aggTrades 补到昨天
+END="${END:-$(date -u -d '1 day ago' +%F)}"   # 日度 aggTrades 补到昨天
 JOBS="${JOBS:-8}"                # 下载并发；Binance Vision 限流时调小
 LEAN="${LEAN:-1}"
+
+# 被 run_all_cloud.sh 编排时 REPO_DIR 可能尚未存在（由调用方负责先准备好代码）；
+# 单独跑则要求代码就位。
+if [ ! -d "$REPO_DIR" ]; then
+    echo "ERROR: $REPO_DIR 不存在；先 clone/解压代码，或直接跑仓库根的 run_all_cloud.sh。"
+    exit 1
+fi
 
 cd "$REPO_DIR"
 pip install -q -r requirements.txt
