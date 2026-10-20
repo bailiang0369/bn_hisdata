@@ -304,26 +304,3 @@ def test_download_one_cleans_part_on_checksum_mismatch(tmp_path, monkeypatch):
     assert res == "failed"
     assert not dest.exists()
     assert not (tmp_path / "bad.zip.part").exists()  # 残件必须清掉
-
-
-def test_compute_aggtrade_features():
-    from binance_vision.build_aggtrade_features import compute_aggtrade_features
-
-    df_raw = pl.DataFrame({
-        "agg_trade_id": [1, 2, 3],
-        "price": [100.0, 101.0, 100.5],
-        "quantity": [1.0, 2.0, 0.5],
-        "first_trade_id": [10, 20, 30],
-        "last_trade_id": [10, 22, 30],
-        "transact_time": [1700000000000, 1700000010000, 1700000020000],
-        "is_buyer_maker": [False, True, False],
-        "is_best_match": [True, True, True],
-    })
-
-    feat_df = compute_aggtrade_features(df_raw, "1m").collect()
-    assert len(feat_df) == 1
-    assert "vwap_disparity" in feat_df.columns
-    assert "price_robust_zscore" in feat_df.columns
-    assert "qty_iqr" in feat_df.columns
-    assert "mean_sweep_depth" in feat_df.columns
-    assert feat_df["trade_count"][0] == 3

@@ -1,15 +1,31 @@
 """
 Extract robust microstructure features from Binance aggTrades Parquet files.
 
-Features extracted per window (default 1m or 5s):
-  - VWAP disparity: (close - vwap) / vwap
-  - Price Median & MAD (Median Absolute Deviation)
-  - Robust Price Z-Score: (close - price_median) / (1.4826 * price_mad)
-  - Realized Volatility (RV) & Up/Down Semi-Variance Ratio
-  - Sweep Depth (mean_sweep_depth, max_sweep_depth)
-  - Trade Quantity Robust Statistics: Median, Q25, Q75, IQR, Q90/Median Tail Ratio
-  - Trade Intensity: trade_count
-  - Inter-Arrival Time: dt_mean, dt_std
+Per 1m window (group_by_dynamic, label="right", so the window timestamp ==
+the kline close_time), ONLY features that 1m klines CANNOT provide are kept
+(2026-10-20 精简，与用户确认):
+
+  - 分钟内价格分布: vwap, vwap_disparity, price_median, price_mad,
+    price_robust_zscore —— K 线只有 OHLC 四个价格点，不知道分钟内的典型
+    成交价在哪、收盘价是否处在极端（收盘价相同的两根 K 线，一根全程低位
+    成交尾盘拉高、一根均匀铺开，只有这些特征能分开）；
+  - 真实已实现波动及方向分解: rv, rv_up, rv_down, semi_var_ratio ——
+    逐笔收益才能干净地分出向上/向下半方差（K 线只能用 (high-low)/close
+    或上下影线近似，把震荡和单边混在一起）；
+  - 成交到达的时间结构: dt_mean, dt_std —— K 线的 count 只给笔数，
+    给不了"均匀铺开 vs 几秒爆发后死寂"，后者常是行情启动前兆。
+
+已删除（与 1m klines 冗余，或在拆单环境下无意义）:
+  - trade_count == klines count；buy/sell 量 == taker_buy_volume 及其补数；
+    volume/turnover、OHLC 同样冗余；
+  - qty_* / sweep_depth（大单特征）—— 交易所普遍支持智能拆单 / Iceberg，
+    单笔大小不再反映意图。
+
+NOTE: log_return / dt_ms use a global shift(1) before the windowed
+aggregation, so each window's first trade references the previous
+window's last trade (a boundary approximation, negligible at 1m scale).
+Per-day pre-aggregation (process_file) makes this per-day: each day's
+first window has a null log_return / dt_ms -- same order of error.
 """
 import argparse
 from pathlib import Path
@@ -19,20 +35,28 @@ import polars as pl
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
 
+# 进 master 宽表的特征列（build_master_features 按市场加 um_agg_ / spot_agg_
+# 前缀）。选取理由见模块文档字符串。
+FEATURE_COLS = [
+    "vwap", "vwap_disparity",
+    "price_median", "price_mad", "price_robust_zscore",
+    "rv", "rv_up", "rv_down", "semi_var_ratio",
+    "dt_mean", "dt_std",
+]
+
 
 def compute_aggtrade_features(df_or_lf: pl.DataFrame | pl.LazyFrame, timeframe: str = "1m") -> pl.LazyFrame:
-    """Compute robust microstructure features from an aggTrades frame.
+    """Compute microstructure features from an aggTrades frame.
 
-    NOTE: log_return / dt_ms use a global shift(1) before the windowed
-    aggregation, so each window's first trade references the previous
-    window's last trade (a boundary approximation, negligible at 1m scale).
+    输出列 = timestamp + close + FEATURE_COLS。close 是窗口内最后一笔成交价
+    （vwap_disparity / price_robust_zscore 需要它）；join 进 master 宽表时
+    丢弃，因为 K 线里已有 close。
     """
     lf = df_or_lf.lazy() if isinstance(df_or_lf, pl.DataFrame) else df_or_lf
 
     # 1. Base derived columns
     lf = lf.with_columns([
         (pl.col("price") * pl.col("quantity")).alias("notional"),
-        (pl.col("last_trade_id") - pl.col("first_trade_id") + 1).alias("sweep_depth"),
         pl.col("transact_time").cast(pl.Datetime("ms")).alias("timestamp"),
     ]).sort("timestamp")
 
@@ -44,36 +68,20 @@ def compute_aggtrade_features(df_or_lf: pl.DataFrame | pl.LazyFrame, timeframe: 
 
     # 2. Resample and aggregate per timeframe window (label="right" so window timestamp matches close_time)
     features_lf = lf.group_by_dynamic("timestamp", every=timeframe, label="right").agg([
-        # OHLC & Close
-        pl.col("price").first().alias("open"),
-        pl.col("price").max().alias("high"),
-        pl.col("price").min().alias("low"),
+        # Close (last trade price of the window; needed by the derived ratios)
         pl.col("price").last().alias("close"),
 
-        # Total Volume & Turnover & VWAP
-        pl.col("quantity").sum().alias("volume"),
-        pl.col("notional").sum().alias("turnover"),
+        # VWAP
         (pl.col("notional").sum() / (pl.col("quantity").sum() + 1e-8)).alias("vwap"),
 
         # Price Robust Statistics (Median & MAD)
         pl.col("price").median().alias("price_median"),
         (pl.col("price") - pl.col("price").median()).abs().median().alias("price_mad"),
 
-        # Quantity Robust Statistics (Median, IQR, Q90)
-        pl.col("quantity").median().alias("qty_median"),
-        pl.col("quantity").quantile(0.25).alias("qty_q25"),
-        pl.col("quantity").quantile(0.75).alias("qty_q75"),
-        pl.col("quantity").quantile(0.90).alias("qty_q90"),
-
         # Realized Volatility & Semi-Variance
         (pl.col("log_return").pow(2).sum() + 1e-12).sqrt().alias("rv"),
         (pl.col("log_return").filter(pl.col("log_return") > 0).pow(2).sum() + 1e-12).sqrt().alias("rv_up"),
         (pl.col("log_return").filter(pl.col("log_return") < 0).pow(2).sum() + 1e-12).sqrt().alias("rv_down"),
-
-        # Sweep Depth & Trade Counts
-        pl.len().alias("trade_count"),
-        pl.col("sweep_depth").mean().alias("mean_sweep_depth"),
-        pl.col("sweep_depth").max().alias("max_sweep_depth"),
 
         # Inter-arrival Time (ms)
         pl.col("dt_ms").mean().alias("dt_mean"),
@@ -82,12 +90,12 @@ def compute_aggtrade_features(df_or_lf: pl.DataFrame | pl.LazyFrame, timeframe: 
         # Secondary Derived Robust Indicators
         ((pl.col("close") - pl.col("vwap")) / (pl.col("vwap") + 1e-8)).alias("vwap_disparity"),
         ((pl.col("close") - pl.col("price_median")) / (1.4826 * pl.col("price_mad") + 1e-8)).alias("price_robust_zscore"),
-        (pl.col("qty_q75") - pl.col("qty_q25")).alias("qty_iqr"),
-        (pl.col("qty_q90") / (pl.col("qty_median") + 1e-8)).alias("qty_tail_ratio"),
         (pl.col("rv_up") / (pl.col("rv_down") + 1e-8)).alias("semi_var_ratio"),
     ])
 
-    return features_lf
+    # 固定输出列序：timestamp + close + FEATURE_COLS（with_columns 会把派生列
+    # 追加到末尾，这里显式定型，便于 build_master_features 按 FEATURE_COLS 前缀重命名）
+    return features_lf.select(["timestamp", "close"] + FEATURE_COLS)
 
 
 def process_file(file_path: Path, dest_dir: Path, timeframe: str = "1m") -> Path:

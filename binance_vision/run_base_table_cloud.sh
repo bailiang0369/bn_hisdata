@@ -2,7 +2,8 @@
 # =============================================================================
 # 魔搭 ModelScope Notebook：基础宽表生成
 #   基础宽表 = um+spot 1m klines + basis + metrics（--no-agg，13+6 列）
-#   aggTrades / orderbook 只贡献衍生特征、下载量大，留第二阶段，本脚本不碰。
+#   aggTrades / orderbook 只贡献衍生特征、下载量大，留第二阶段，本脚本不碰
+#   （第二阶段见同目录 run_aggtrades_cloud.sh）。
 #
 # 设计原则（2026-10-20 修正版）：
 #   - 所有数据落在 /mnt/workspace（持久化存储，100GB 配额），不碰 /root
