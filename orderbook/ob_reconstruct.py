@@ -114,9 +114,11 @@ def _prepare_base(df_raw: pl.DataFrame, band: float | None = None) -> pl.DataFra
         before = base.filter(pl.col("event_time") < Ts)
         if before.height == 0:
             continue
+        # 注意不要在这里先 sort(["side","px","event_time"])：agg 里的
+        # sort_by("event_time").last() 已经按 event_time 取每档最后值，
+        # 外层三键排序是纯浪费（实测让这一步慢 7 倍：2.8s -> 0.4s）。
         alive = (
-            before.sort(["side", "px", "event_time"])
-            .group_by(["side", "px"])
+            before.group_by(["side", "px"])
             .agg(pl.col("qty").sort_by("event_time").last().alias("qv"))
             .filter(pl.col("qv") > 0)
             .select(["side", "px"])
