@@ -44,7 +44,31 @@ python binance_vision/download_binance_vision.py --market both --symbol all \
 python binance_vision/download_binance_vision.py --market um --symbol all \
     --category metrics --granularity daily \
     --start-date 2025-06-01 --end-date 2025-06-30
+
+# aggTrades（微观结构特征来源）：注意 --category all 只含 klines + metrics，
+# 不含 aggTrades，必须显式指定。aggTrades 只有日度文件（月度文件不存在），
+# 且体积大（BTCUSDT um 单日 ~1M 笔），建议 -j 提高并发。
+python binance_vision/download_binance_vision.py --market um --symbol BTCUSDT \
+    --category aggTrades --interval 1m --granularity daily \
+    --start-date 2025-06-01 --end-date 2025-06-30 -j 8
 ```
+
+> aggTrades 两种真实格式（下载器已自动适配，输出统一为毫秒）：
+> um = 7 列有表头、毫秒时间戳；spot = 8 列无表头、微秒时间戳。
+
+# 第一阶段：基础宽表（um+spot klines + basis + metrics，全流式 lazy 管道）。
+# aggTrades 和 orderbook 一样：下载量大、只贡献衍生特征不进原表，放第二阶段。
+# --no-agg 显式跳过 aggTrades，输出 {symbol}_base_features_1m.parquet
+python binance_vision/build_master_features.py --symbol BTCUSDT --no-agg
+
+# 第二阶段：补下 aggTrades 后重建完整 master 表（此时缺 aggTrades 会硬失败）
+python binance_vision/download_binance_vision.py --market um --symbol BTCUSDT \
+    --category aggTrades --interval 1m --granularity daily \
+    --start-date 2025-06-01 --end-date 2026-10-01 -j 8
+python binance_vision/build_master_features.py --symbol BTCUSDT
+
+# 单元测试（从仓库根运行；根目录 conftest.py 负责把仓库根加入 sys.path）
+python -m pytest binance_vision -q
 
 数据默认落在各模块自己的 `data/` 目录（已在 `.gitignore` 中忽略，不入库）。项目依赖见
 根目录 `requirements.txt`（`polars`、`zstandard`）。
