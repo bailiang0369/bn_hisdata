@@ -9,7 +9,8 @@ Unit tests for orderbook/ob_reconstruct.py
 """
 import polars as pl
 
-from ob_reconstruct import reconstruct_state, reconstruct_state_sparse
+from ob_reconstruct import (_grid_pairs, _prepare_base, reconstruct_state,
+                            reconstruct_state_sparse)
 
 T0 = 1700000040000  # 60000 的整数倍，一个整点边界
 BAND = 0.003
@@ -195,6 +196,34 @@ def test_sparse_single_sided_falls_back_to_dense():
         (T0 + 10_000, "update", "bid", 99.0, 3.0),
     ]
     df = _df(events)
+    assert reconstruct_state_sparse(df, band=BAND).equals(reconstruct_state(df))
+
+
+def test_sparse_pairs_path_is_actually_used():
+    """快速路径必须真的被用上——不能永远悄悄回退 dense（那优化就白做了）。
+    正常文件（每分钟都有双侧触及）应当走出 pairs 路径且行数少于 dense。"""
+    df = _df(_swing_events())
+    out = _grid_pairs(_prepare_base(df), BAND)
+    assert out is not None, "pairs path fell back on a normal file"
+    assert out.height < reconstruct_state(df).height
+
+
+def test_sparse_pairs_falls_back_when_window_cannot_be_proven():
+    """安全网：治理消息之后本分钟只剩 removal、把带内买档全部删掉时，
+    自校验（缺桶 / mid 出界）必须不过 -> 整个小时回退 dense，输出与 dense
+    完全一致（若不过校验，快速路径会静默丢掉全部买档行）。"""
+    events = [
+        (T0, "snapshot", "bid", 100.0, 5.0),
+        (T0, "snapshot", "bid", 99.0, 3.0),
+        (T0, "snapshot", "bid", 50.0, 1.0),   # 深档：窗口外
+        (T0, "snapshot", "ask", 101.0, 4.0),
+        (T0 + 10_000, "update", "bid", 100.0, 6.0),  # 本分钟最后一次买档触及
+        (T0 + 20_000, "update", "bid", 100.0, 0.0),  # 之后只剩 removal
+        (T0 + 30_000, "update", "bid", 99.0, 0.0),
+    ]
+    df = _df(events)
+    assert _grid_pairs(_prepare_base(df), BAND) is None, \
+        "self-check passed on an unprovable window -- safety net broken"
     assert reconstruct_state_sparse(df, band=BAND).equals(reconstruct_state(df))
 
 
