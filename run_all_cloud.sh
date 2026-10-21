@@ -33,6 +33,9 @@
 #   CHD_API_KEY  orderbook R2 下载必需
 #   SKIP_VISION=1    只跑 orderbook
 #   SKIP_ORDERBOOK=1 只跑 binance_vision
+#   MODE       orderbook 重建模式：dense（默认，零 caveat 参照）或 sparse
+#             （省 8 倍内存、快 ~15%，任一分钟窗口不可证明时自动回退 dense，
+#              见 orderbook/docs/orderbook_lessons.md §12；小内存 VM 推荐 sparse）
 #
 # 磁盘：最终产物 ~10GB（orderbook 窄表 ~9GB + 特征/宽表）；原始按天删，
 #       峰值只压"当天原始 + 已累计窄表"。
@@ -48,6 +51,7 @@ START="${START:-2025-06-01}"
 END="${END:-$(date -u -d '1 day ago' +%F)}"
 JOBS="${JOBS:-8}"
 LEAN="${LEAN:-1}"
+MODE="${MODE:-dense}"
 ob_rc=0
 
 if [ ! -d "$REPO_DIR" ]; then
@@ -83,12 +87,12 @@ else
         echo "  export CHD_API_KEY=xxx 后重跑；或 SKIP_ORDERBOOK=1 只跑 vision。"
         exit 1
     fi
-    echo "=== [3/4] orderbook pipeline（r2，两市场，$START .. $END）==="
+    echo "=== [3/4] orderbook pipeline（r2，两市场，$START .. $END，mode=$MODE）==="
     # pipeline 对单日失败只记录不中断（退出码非 0）；这里不让它中断收尾，
     # 失败的天重跑本命令即断点续传。
     set +e
     python orderbook/pipeline.py --start-date "$START" --end-date "$END" \
-        --download r2 --band 0.003
+        --download r2 --band 0.003 --mode "$MODE"
     ob_rc=$?
     set -e
     echo "orderbook pipeline exit=$ob_rc（非 0 = 有天失败，重跑续传）"
