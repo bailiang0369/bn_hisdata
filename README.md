@@ -8,7 +8,8 @@ BTCUSDT 历史数据工程。按数据源与处理逻辑分模块组织：
 - `binance_vision/` — K 线 / aggTrades / metrics，直接来自官方
   `https://data.binance.vision`。下载并清洗成 parquet（默认）或 CSV：统一表头、
   klines 拆成主动买/卖成交量（`buy_vol` / `sell_vol`）、校验和校验、按天/按月、
-  断点续传。处理逻辑与订单簿完全不同，故独立成模块。
+  断点续传。处理逻辑与订单簿完全不同，故独立成模块。踩坑与决策史见
+  `binance_vision/docs/binance_vision_lessons.md`。
 
 ## 全链路一键（推荐）
 
