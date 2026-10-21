@@ -105,10 +105,12 @@ def download(date: str, exchanges: list[str], dest_root: str, backend: str) -> N
         raise RuntimeError(f"download failed (rc={rc}) for {date}")
 
 
-def build(date: str, exchanges: list[str], dest_root: str, band: float) -> None:
+def build(date: str, exchanges: list[str], dest_root: str, band: float,
+          mode: str) -> None:
     for ex in exchanges:
         rc = run_cmd([sys.executable, "build_minute_snapshots.py",
                       "--date", date, "--exchange", ex, "--band", str(band),
+                      "--mode", mode,
                       "--dest-root", dest_root,
                       "--out", f"{dest_root}/{date}/{ex}_minute_band.parquet"])
         if rc != 0:
@@ -130,13 +132,13 @@ def cleanup(date: str, exchanges: list[str], dest_root: str) -> None:
 
 
 def process_day(date: str, exchanges: list[str], dest_root: str,
-               band: float, backend: str) -> None:
+               band: float, backend: str, mode: str) -> None:
     t0 = time.time()
     print(f"\n===== {date} =====", flush=True)
     download(date, exchanges, dest_root, backend)
     for ex in exchanges:
         normalize_raw(Path(f"{dest_root}/{date}/{ex}"))
-    build(date, exchanges, dest_root, band)
+    build(date, exchanges, dest_root, band, mode)
     cleanup(date, exchanges, dest_root)
     print(f"===== {date} done in {time.time() - t0:.1f}s =====", flush=True)
 
@@ -159,6 +161,10 @@ def main() -> int:
     ap.add_argument("--dest-root", default=str(DATA),
                     help="Local data root (default: <module>/data)")
     ap.add_argument("--band", type=float, default=0.003)
+    ap.add_argument("--mode", choices=["dense", "sparse"], default="dense",
+                    help="dense=zero-caveat reference (default); sparse=8x less "
+                         "memory, ~15%% faster, auto-falls-back to dense on any "
+                         "unprovable minute window (see orderbook_lessons §12)")
     ap.add_argument("--download", choices=["api", "r2"], default="api",
                     help="api=anonymous (slow), r2=fast (needs CHD_API_KEY)")
     args = ap.parse_args()
@@ -187,7 +193,8 @@ def main() -> int:
             print(f"skip {d} (band already built)", flush=True)
             continue
         try:
-            process_day(d, exchanges, args.dest_root, args.band, args.download)
+            process_day(d, exchanges, args.dest_root, args.band, args.download,
+                        args.mode)
         except Exception as exc:  # noqa: BLE001 - 单日失败显式记录并继续，不静默吞掉
             print(f"  FAILED {d}: {exc}", file=sys.stderr, flush=True)
             failed.append(d)

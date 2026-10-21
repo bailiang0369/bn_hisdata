@@ -45,6 +45,10 @@ CHD_API_KEY=xxx bash run_all_cloud.sh 2>&1 | tee run_all.log
 python orderbook/pipeline.py --date 2026-10-12
 python orderbook/pipeline.py --start-date 2025-06-01 --end-date 2025-06-30 --download r2
 
+# 小内存 VM（如一次性 Jules/云 VM）省内存：sparse 模式（中间结构小 8 倍、快 ~15%，
+# 任一分钟窗口不可证明时自动回退 dense，见 orderbook/docs/orderbook_lessons.md §12）
+python orderbook/pipeline.py --date 2026-10-12 --mode sparse
+
 # 单独步骤
 python orderbook/download_day.py --date 2026-10-12 --exchange binance_spot        # 匿名 API 下载
 python orderbook/download_orderbook_s3.py --date 2026-10-12                       # R2 直连（需 CHD_API_KEY）
@@ -54,6 +58,10 @@ python orderbook/validate_snapshot_consistency.py --date 2026-10-12 --exchange b
 # 把每日窄表聚合成月度 parquet（特征计算的折中粒度，可选）
 python orderbook/merge_monthly.py --dest-root orderbook/data
 ```
+
+> 重建模式：默认 **dense**（零 caveat 参照实现）。`pipeline.py` / `build_minute_snapshots.py`
+> 的 `--mode` 可切换为 `sparse`（省内存/提速，自动回退 dense）；`run_all_cloud.sh`
+> 用 `MODE=dense|sparse` 环境变量控制（默认 dense）。产物完全一致（带内逐帧相等）。
 
 ## binance_vision 模块
 
