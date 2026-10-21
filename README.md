@@ -31,7 +31,9 @@ CHD_API_KEY=xxx bash run_all_cloud.sh 2>&1 | tee run_all.log
 盯着不行；Jules 之类的一次性云 VM 也不行（任务结束 VM 即销毁，产出只能走 git
 分支带回，10GB+ 的 parquet 不可能这么搬）。用按量付费的持久小机器
 （AutoDL / 智星云 / ECS，系统盘 40GB+ 足够：原始按天删，峰值只压当天数据，
-最终产物 ~10GB）。时长参考（~490 天窗口）：vision 1–3h，orderbook 两市场 12–24h。
+最终产物 ~10GB）。时长参考（~490 天窗口）：vision 1–3h，orderbook 两市场串行
+~17h（弱机下限；现代 4+ vCPU 约 6–10h，实测与调优记录见
+`orderbook/docs/orderbook_lessons.md` §7 / §11）。
 
 ## orderbook 模块
 
