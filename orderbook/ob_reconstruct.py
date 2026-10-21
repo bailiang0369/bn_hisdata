@@ -30,21 +30,39 @@ import polars as pl
 def _prepare_base(df_raw: pl.DataFrame) -> pl.DataFrame:
     """Cast + split snapshot/update rows + synthesize snapshot removals.
 
-    Returns the event base (side, px, qty, event_time) with, for every snapshot
-    time Ts, qty=0 removal records for the levels alive just before Ts but
-    absent from that snapshot (full-book-replacement semantics).
+    Returns the event base (side, px, qty, event_time, _seq) with, for every
+    snapshot time Ts, qty=0 removal records for the levels alive just before
+    Ts but absent from that snapshot (full-book-replacement semantics).
+
+    Two correctness details (2026-10-21, both surfaced by an external review
+    of the previous revision):
+      * snap_times is taken from ALL snapshot rows, qty==0 included. An
+        all-zero snapshot (empty book) must still register: otherwise it
+        triggers no removal synthesis and the previous book silently
+        survives a "full replacement" that replaced nothing.
+      * _seq is the raw file row order (Float64) and is the deterministic
+        tie-breaker for same-millisecond rows on the same level -- polars'
+        sort is not guaranteed stable, so sort_by("event_time") alone may
+        pick either of two same-ms rows depending on thread count. Removal
+        records are placed at (first row of their snapshot) - 0.5 so that a
+        same-ms update FOLLOWING the snapshot in file order wins (it is
+        post-reconnect state) while one PRECEDING it loses (the snapshot's
+        full-book replacement supersedes it).
     """
     df = df_raw.with_columns([
         pl.col("price").cast(pl.Float64).alias("px"),
         pl.col("quantity").cast(pl.Float64).alias("qty"),
-    ])
-    snaps = df.filter(pl.col("event_type") == "snapshot").filter(pl.col("qty") > 0)
+    ]).with_row_index("_seq").with_columns(pl.col("_seq").cast(pl.Float64))
+    snaps_all = df.filter(pl.col("event_type") == "snapshot")
+    snaps = snaps_all.filter(pl.col("qty") > 0)
     upds = df.filter(pl.col("event_type") == "update")
-    snap_times = sorted(snaps["event_time"].unique().to_list())
+    # 快照时间从**全部**快照行取（含 qty==0）：全零快照也要登记，否则它不
+    # 触发移除合成，之前的档位会残留（静默错误，2026-10-21 外部审查发现）。
+    snap_times = sorted(snaps_all["event_time"].unique().to_list())
 
-    snap_present = snaps.select(["side", "px", "qty", "event_time"])
+    snap_present = snaps.select(["side", "px", "qty", "event_time", "_seq"])
     base = pl.concat(
-        [upds.select(["side", "px", "qty", "event_time"]), snap_present],
+        [upds.select(["side", "px", "qty", "event_time", "_seq"]), snap_present],
         how="diagonal",
     )
 
@@ -55,19 +73,27 @@ def _prepare_base(df_raw: pl.DataFrame) -> pl.DataFrame:
         if before.height == 0:
             continue
         # 注意不要在这里先 sort(["side","px","event_time"])：agg 里的
-        # sort_by("event_time").last() 已经按 event_time 取每档最后值，
+        # sort_by(...).last() 已经按 (event_time, _seq) 取每档最后值，
         # 外层三键排序是纯浪费（实测让这一步慢 7 倍：2.8s -> 0.4s）。
+        # _seq 是同毫秒平局的确定性裁决依据（polars sort 不保证稳定）。
         alive = (
             before.group_by(["side", "px"])
-            .agg(pl.col("qty").sort_by("event_time").last().alias("qv"))
+            .agg(pl.col("qty").sort_by(["event_time", "_seq"]).last().alias("qv"))
             .filter(pl.col("qv") > 0)
             .select(["side", "px"])
         )
+        # in_snap 只含 qty>0 的快照行：零量行本身就是删除语义，其档位若存活
+        # 会被 anti join 补上移除记录（与旧行为一致，真实数据验证过）。
         in_snap = snaps.filter(pl.col("event_time") == Ts).select(["side", "px"])
         rem = alive.join(in_snap, on=["side", "px"], how="anti")
         rem = rem.with_columns([
             pl.lit(0.0).cast(pl.Float64).alias("qty"),
             pl.lit(Ts).cast(pl.Int64).alias("event_time"),
+            # 排序位次放在该快照首行之前半点：同毫秒内，快照之后到的 update
+            # 胜过移除（重连后状态），之前到的输给移除（整书替换压过它）。
+            pl.lit(
+                snaps_all.filter(pl.col("event_time") == Ts)["_seq"].min() - 0.5
+            ).alias("_seq"),
         ])
         removal_frames.append(rem)
     if removal_frames:
@@ -133,7 +159,7 @@ def _agg_keys(base: pl.DataFrame):
         .cast(pl.Int8).alias("sc"),
     ])
     agg = b2.group_by(["sc", "px", "bucket"]).agg(
-        pl.col("qty").sort_by("event_time").last().alias("q")
+        pl.col("qty").sort_by(["event_time", "_seq"]).last().alias("q")
     )
     keys = agg.select(["sc", "px"]).unique().sort(["sc", "px"])
     return agg, keys

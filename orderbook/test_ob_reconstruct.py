@@ -100,6 +100,65 @@ def test_snapshot_removal_lands_in_right_bucket():
     assert _q(m, "bid", 100.0, T0 + 60_000) == 5.0
 
 
+def test_all_zero_snapshot_registers_and_clears_book():
+    """全零快照（整书替换为空）也必须登记：否则不触发移除合成，旧盘口静默残留。
+
+    旧实现 snap_times 只从 qty>0 的快照行取 -> 全零快照不登记 -> 之前档位
+    泄漏。这是 2026-10-21 外部审查发现的两个真实问题之一。
+    """
+    events = [
+        (T0, "snapshot", "bid", 100.0, 5.0),
+        (T0, "snapshot", "ask", 101.0, 4.0),
+        # 第 2 分钟一个全零快照（整书替换为空）
+        (T0 + 70_000, "snapshot", "bid", 100.0, 0.0),
+        (T0 + 70_000, "snapshot", "ask", 101.0, 0.0),
+        (T0 + 130_000, "update", "bid", 99.0, 2.0),  # 之后重新挂档
+    ]
+    m = reconstruct_state(_df(events))
+    assert _q(m, "bid", 100.0, T0) == 5.0
+    # 全零快照之后：100 / 101 全部被清掉（移除事件落在 T0+70s 所在桶 T0+60s）
+    assert _q(m, "bid", 100.0, T0 + 60_000) == 0.0
+    assert _q(m, "ask", 101.0, T0 + 60_000) == 0.0
+    # 之后重新挂档（T0+130s 属于第 3 分钟桶 T0+120s），且之前档位维持清空
+    assert _q(m, "bid", 99.0, T0 + 120_000) == 2.0  # 重新挂档生效
+    assert _q(m, "bid", 100.0, T0 + 120_000) == 0.0
+    assert _q(m, "ask", 101.0, T0 + 120_000) == 0.0
+
+
+def test_same_ms_tie_break_is_file_order():
+    """同毫秒同档位多行：按文件行序确定性裁决（polars sort 不保证稳定）。
+
+    - update 在同一毫秒、且文件里排在快照之后 -> update 赢（重连后状态）
+    - update 在同一毫秒、且文件里排在快照之前 -> 移除赢（快照整书替换压过它）
+    2026-10-21 外部审查发现：旧实现依赖 concat 顺序 + 不稳定 sort，同毫秒平局
+    取值随线程数变化，非确定性。
+    """
+    # 快照在 update 之前（文件序：snapshot 行先，update 行后）
+    events_after = [
+        (T0, "snapshot", "bid", 100.0, 5.0),
+        (T0, "snapshot", "ask", 101.0, 4.0),
+        (T0 + 60_000, "update", "bid", 99.0, 2.0),
+        (T0 + 120_000, "snapshot", "bid", 100.0, 6.0),   # 重连快照
+        (T0 + 120_000, "snapshot", "ask", 101.0, 4.0),
+        (T0 + 120_000, "update", "bid", 99.0, 9.0),      # 同毫秒、快照之后
+    ]
+    m = reconstruct_state(_df(events_after))
+    assert _q(m, "bid", 99.0, T0 + 120_000) == 9.0  # 后到的 update 赢
+    assert _q(m, "bid", 100.0, T0 + 120_000) == 6.0
+
+    # 同毫秒但 update 在文件里排在快照之前 -> 移除赢
+    events_before = [
+        (T0, "snapshot", "bid", 100.0, 5.0),
+        (T0, "snapshot", "ask", 101.0, 4.0),
+        (T0 + 60_000, "update", "bid", 99.0, 2.0),
+        (T0 + 120_000, "update", "bid", 99.0, 9.0),      # 同毫秒、快照之前
+        (T0 + 120_000, "snapshot", "bid", 100.0, 6.0),
+        (T0 + 120_000, "snapshot", "ask", 101.0, 4.0),
+    ]
+    m2 = reconstruct_state(_df(events_before))
+    assert _q(m2, "bid", 99.0, T0 + 120_000) == 0.0  # 快照压过先前的 update
+
+
 def test_forward_fill_and_explicit_removal():
     """qty=0 的 update 是显式删除；无变更的档位按桶前向填充。
 
