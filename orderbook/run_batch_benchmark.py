@@ -126,7 +126,10 @@ def main() -> int:
         try:
             with open(out_json, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-                results["daily"].update(loaded.get("daily", {}))
+                # Filter out failed or zero-byte daily entries
+                for k, v in loaded.get("daily", {}).items():
+                    if v.get("status") == "success" and v.get("spot_band_bytes", 0) > 0:
+                        results["daily"][k] = v
                 results["monthly"].update(loaded.get("monthly", {}))
         except Exception as exc:
             print(f"Warning: could not read existing benchmark json: {exc}")
@@ -145,8 +148,8 @@ def main() -> int:
         for d in month_days:
             day_dir = dest_root / d
 
-            # Skip if already successfully processed in benchmark results
-            if d in results["daily"] and results["daily"][d].get("status") == "success":
+            # Skip if already successfully processed in benchmark results with non-zero size
+            if d in results["daily"] and results["daily"][d].get("status") == "success" and results["daily"][d].get("spot_band_bytes", 0) > 0:
                 print(f"[{d}] skipped (already processed in benchmark)", flush=True)
                 continue
 

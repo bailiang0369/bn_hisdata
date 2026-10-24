@@ -136,8 +136,8 @@ def main() -> int:
     bucket = creds["bucket"]
 
     def build_client(cr):
-        # Large per-request timeout: a 17 MB futures file at limited egress speed
-        # can take well over a minute to stream, so the default 60 s would time out.
+        # Reasonable per-request timeout (90s): prevents socket hangs from blocking
+        # the entire thread pool for half an hour when TCP connections drop.
         return S3LiteClient(
             endpoint=cr["endpoint"],
             access_key_id=cr["credentials"]["access_key_id"],
@@ -145,7 +145,7 @@ def main() -> int:
             session_token=cr["credentials"].get("session_token"),
             region=cr.get("region") or "auto",
             max_pool_connections=args.workers,
-            timeout=1800,
+            timeout=90,
             max_attempts=5,
         )
 

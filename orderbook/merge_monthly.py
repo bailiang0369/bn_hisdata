@@ -48,32 +48,15 @@ def collect_days(dest_root: Path, exchange: str):
     return band, mid
 
 
-def _bucket_sorted(path: Path) -> bool:
-    """每日文件是否已按 bucket 升序（只读 bucket 单列，列存扫描很快）。"""
-    s = pl.scan_parquet(path).select("bucket").collect()
-    return s["bucket"].is_sorted()
-
-
 def _merge(files, out: Path) -> None:
     """按日期顺序流式合并为月份 parquet，保证月份内 bucket 严格升序。
 
     `build_minute_snapshots.py` 产出的每日文件已按 bucket 排好序，且日与日之间
-    bucket 区间不重叠，因此按日期顺序 concat 天然有序——不再需要（昂贵的）月级
-    全局 sort。对早期遗留的无序每日文件，单独排序后按原日期位置并入：每个 concat
-    段内部有序、段间按日期排列，整体仍然有序。
+    bucket 区间不重叠，因此按日期顺序 concat 天然有序，可以直接惰性流式写出。
     """
-    parts = []
-    n_legacy = 0
-    for f in files:
-        lf = pl.scan_parquet(f)
-        if not _bucket_sorted(f):
-            lf = lf.sort("bucket")
-            n_legacy += 1
-        parts.append(lf)
+    parts = [pl.scan_parquet(f) for f in files]
     lf = pl.concat(parts, how="vertical_relaxed")
     lf.sink_parquet(str(out))
-    if n_legacy:
-        print(f"  note: {n_legacy}/{len(files)} 个每日文件为遗留无序产物，已单独排序并入")
 
 
 def main() -> None:
