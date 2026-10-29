@@ -247,6 +247,34 @@ def main() -> int:
                 return
             yield chunk
 
+    def _probe_exists(exchange: str, hour: int):
+        """探测某小时文件是否存在。True=存在，False=两后缀均 404（确认缺失），None=不确定。"""
+        key0 = f"{exchange}/{date}/{hour:02d}/{SYMBOL}_{DATA_TYPE}"
+        for suffix in suffixes:
+            try:
+                resp = cred_state["client"].get_object(Bucket=bucket, Key=key0 + suffix)
+                resp["Body"].close()  # 只需存在性，不读完整 body
+                return True
+            except S3LiteError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if code in ("NoSuchKey", "404", "NotFound") or status == 404:
+                    continue
+                return None
+        return False
+
+    # ---- 阶段 1：先探测当天第一个小时（两交易所各 1 个请求）----
+    # 任一确认 404 -> 整日视为缺失，置 day_abort 后所有任务直接跳过，
+    # 一个多余请求都不发（缺数天成本从 ~32 个请求降到 2 个）。
+    first_hour = hours[0]
+    probe = {ex: _probe_exists(ex, first_hour) for ex in EXCHANGES}
+    if any(r is False for r in probe.values()):
+        day_abort.set()
+        _p = ", ".join(f"{ex}={'MISSING' if r is False else ('ok' if r else 'unknown')}"
+                       for ex, r in probe.items())
+        print(f"probe {date} hour {first_hour:02d}: {_p} -> day incomplete, "
+              f"skip all {len(jobs)} downloads")
+
     ok = miss = skip = err = abort = 0
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
