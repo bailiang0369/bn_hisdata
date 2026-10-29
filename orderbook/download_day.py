@@ -142,7 +142,8 @@ def main() -> int:
             continue
         if got is None:
             miss += 1
-            print(f"404  {args.exchange} {hour:02d}")
+            print(f"404  {args.exchange} {hour:02d} -> day incomplete, stop remaining hours")
+            break  # 当天已有文件缺失，其余小时不再下载
         else:
             ok += 1
             print(f"ok   {args.exchange} {hour:02d} {got:,} bytes")

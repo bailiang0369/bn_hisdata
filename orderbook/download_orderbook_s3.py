@@ -183,11 +183,17 @@ def main() -> int:
     hours = args.hours if args.hours is not None else list(range(24))
     jobs = [(ex, h) for ex in EXCHANGES for h in hours]
 
+    # 当天任意文件确认缺失（两个后缀都 404）即认为整日缺失：其余排队中的文件不再下载，
+    # 立刻节省 CHD 额度。已在途的请求无法取消，但排队中的会被跳过。
+    day_abort = threading.Event()
+
     cutover = datetime.fromisoformat(args.date) >= datetime.fromisoformat(NATIVE_ZSTD_CUTOVER_DATE)
     suffixes = (".parquet", ".parquet.zst") if cutover else (".parquet.zst", ".parquet")
 
     def worker(exchange: str, hour: int) -> tuple[str, str, int]:
         label = f"{exchange}/{hour:02d}"
+        if day_abort.is_set():
+            return (label, "abort", 0)
         dest = root / exchange / f"{hour:02d}" / f"{SYMBOL}_{DATA_TYPE}.parquet"
         # _write_payload 总是解压，所以无论命中 .parquet 还是 .parquet.zst，落盘都是
         # 无压缩的 .parquet：文件名与内容一致，且跳过判断对 pre-cutover 也成立。
@@ -230,6 +236,8 @@ def main() -> int:
                 # 日志里上报"落盘后实际文件大小"（解压后），而非线上的压缩字节数，
                 # 避免把解压文件的真实体积误报成压缩体积。
                 return (label, "ok", dest.stat().st_size)
+        # 两个后缀都拿不到 -> 该小时文件确实缺失 -> 整日视为缺失，停止当天其余下载
+        day_abort.set()
         return (label, "404", 0)
 
     def _iter_body(body):
@@ -239,7 +247,7 @@ def main() -> int:
                 return
             yield chunk
 
-    ok = miss = skip = err = 0
+    ok = miss = skip = err = abort = 0
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(worker, ex, h): (ex, h) for ex, h in jobs}
@@ -253,6 +261,8 @@ def main() -> int:
             elif status == "404":
                 miss += 1
                 print(f"404  {label}")
+            elif status == "abort":
+                abort += 1
             else:
                 err += 1
                 print(f"ERR  {label}: {status}", file=sys.stderr)
@@ -263,7 +273,7 @@ def main() -> int:
 
     dt = time.time() - t0
     print(f"\nDone in {dt:.1f}s: {ok} downloaded, {skip} present, {miss} missing, "
-          f"{err} errored for {date}")
+          f"{abort} aborted(day-missing), {err} errored for {date}")
     if err:
         return 1
     return 0
