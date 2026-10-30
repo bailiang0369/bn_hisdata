@@ -80,6 +80,8 @@ def main() -> int:
     ap.add_argument("--exchange", default="binance_futures")
     ap.add_argument("--dest-root", default=str(HERE / "data"))
     ap.add_argument("--sleep", type=float, default=1.5)
+    ap.add_argument("--quiet", action="store_true",
+                   help="抑制逐小时 ok/404/skip 刷屏，只打印汇总")
     args = ap.parse_args()
 
     try:
@@ -104,7 +106,8 @@ def main() -> int:
             None,
         )
         if existing is not None:
-            print(f"skip {args.exchange} {hour:02d} (exists)")
+            if not args.quiet:
+                print(f"skip {args.exchange} {hour:02d} (exists)")
             ok += 1
             continue
         got = None
@@ -142,11 +145,13 @@ def main() -> int:
             continue
         if got is None:
             miss += 1
-            print(f"404  {args.exchange} {hour:02d} -> day incomplete, stop remaining hours")
+            if not args.quiet:
+                print(f"404  {args.exchange} {hour:02d} -> day incomplete, stop remaining hours")
             break  # 当天已有文件缺失，其余小时不再下载
         else:
             ok += 1
-            print(f"ok   {args.exchange} {hour:02d} {got:,} bytes")
+            if not args.quiet:
+                print(f"ok   {args.exchange} {hour:02d} {got:,} bytes")
         time.sleep(args.sleep)
 
     total = sum(f.stat().st_size for f in root.rglob("*") if f.is_file())

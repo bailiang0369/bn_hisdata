@@ -118,6 +118,8 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=32, help="Concurrent downloads (default 32)")
     ap.add_argument("--hours", type=int, nargs="+", default=None,
                    help="Hours to download, e.g. 0 1 2 (default: all 0-23)")
+    ap.add_argument("--quiet", action="store_true",
+                   help="只打印每日汇总与缺数天探测行，抑制逐文件 ok/skip/abort 刷屏")
     args = ap.parse_args()
 
     api_key = os.environ.get("CHD_API_KEY")
@@ -283,12 +285,14 @@ def main() -> int:
             label, status, size = fut.result()
             if status == "ok":
                 ok += 1
-                print(f"ok   {label:24s} {size:,} bytes")
+                if not args.quiet:
+                    print(f"ok   {label:24s} {size:,} bytes")
             elif status == "skip":
                 skip += 1
             elif status == "404":
                 miss += 1
-                print(f"404  {label}")
+                if not args.quiet:
+                    print(f"404  {label}")
             elif status == "abort":
                 abort += 1
             else:

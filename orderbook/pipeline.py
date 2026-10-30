@@ -93,12 +93,13 @@ def download(date: str, exchanges: list[str], dest_root: str, backend: str) -> N
     if backend == "r2":
         # R2 fetches both exchanges in one invocation
         rc = run_cmd([sys.executable, "download_orderbook_s3.py",
-                      "--date", date, "--dest-root", dest_root])
+                      "--date", date, "--dest-root", dest_root, "--quiet"])
     else:
         rc = 0
         for ex in exchanges:
             rc = run_cmd([sys.executable, "download_day.py",
-                          "--date", date, "--exchange", ex, "--dest-root", dest_root])
+                          "--date", date, "--exchange", ex,
+                          "--dest-root", dest_root, "--quiet"])
             if rc != 0:
                 break
     if rc != 0:
