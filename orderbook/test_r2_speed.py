@@ -6,8 +6,9 @@
 
 用法：
     export CHD_API_KEY=your-key
-    python orderbook/test_r2_speed.py 2025-07-01 32 all        # 整日（两交易所各 24h=48 文件）并发
-    python orderbook/test_r2_speed.py 2025-07-01 8 0,1,2,3     # 轻量试水
+    python orderbook/test_r2_speed.py 2025-07-01 32 all            # 整日（两交易所各 24h=48 文件）并发
+    python orderbook/test_r2_speed.py 2025-07-01 8 0,1,2,3         # 轻量试水（8 个文件）
+    python orderbook/test_r2_speed.py 2025-07-01 4 0 binance_futures   # 单文件测速
 
 鉴权方式与 download_orderbook_s3.py 完全一致；只测下载吞吐，不做构建。
 """
@@ -31,10 +32,12 @@ if not API_KEY:
 DATE = sys.argv[1] if len(sys.argv) > 1 else "2025-07-01"
 WORKERS = int(sys.argv[2]) if len(sys.argv) > 2 else 32
 HOURS_ARG = sys.argv[3] if len(sys.argv) > 3 else "all"
+EXCHANGE_ARG = sys.argv[4] if len(sys.argv) > 4 else None
 if HOURS_ARG == "all":
     HOURS = list(range(24))
 else:
     HOURS = [int(h) for h in HOURS_ARG.split(",") if h.strip() != ""]
+EXS = [EXCHANGE_ARG] if EXCHANGE_ARG else EXCHANGES
 
 cutover = datetime.fromisoformat(DATE) >= datetime.fromisoformat(NATIVE_ZSTD_CUTOVER_DATE)
 suffix = ".parquet.zst" if not cutover else ".parquet"
@@ -56,7 +59,7 @@ def keys_for(ex):
     return [f"{ex}/{DATE}/{h:02d}/{SYMBOL}_{DATA_TYPE}{suffix}" for h in HOURS]
 
 
-KEYS = [k for ex in EXCHANGES for k in keys_for(ex)]
+KEYS = [k for ex in EXS for k in keys_for(ex)]
 
 
 def fetch(key):
