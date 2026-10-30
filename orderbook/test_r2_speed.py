@@ -24,6 +24,14 @@ from download_orderbook_s3 import (
 )
 from s3lite import S3LiteClient
 
+# 强制 IPv4：国内/机房环境 IPv6 常被黑洞，requests 会先试 v6 并卡满超时才回落，
+# 表现为"看似永久卡死"。curl -4 能通而 Python 卡死即此因。
+import socket
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_only(*args, **kwargs):
+    return [ai for ai in _orig_getaddrinfo(*args, **kwargs) if ai[0] == socket.AF_INET]
+socket.getaddrinfo = _ipv4_only
+
 API_KEY = os.environ.get("CHD_API_KEY")
 if not API_KEY:
     print("ERROR: set CHD_API_KEY environment variable first")
@@ -68,11 +76,17 @@ def fetch(key):
         resp = client.get_object(Bucket=bucket, Key=key)
         body = resp["Body"]
         n = 0
+        last = 0
         while True:
             chunk = body.read(1024 * 1024)
             if not chunk:
                 break
             n += len(chunk)
+            if n - last >= 2 * 1024 * 1024:  # 慢链路下也能看到实时速率，不再像卡死
+                dt = time.time() - t0
+                print(f"    {key.rsplit('/', 1)[-1]}: {n / 1e6:.1f} MB "
+                      f"@ {n / 1e6 / dt:.2f} MB/s", flush=True)
+                last = n
         body.close()
         return n, time.time() - t0, None
     except Exception as e:  # noqa: BLE001
