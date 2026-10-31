@@ -11,6 +11,28 @@ BTCUSDT 历史数据工程。按数据源与处理逻辑分模块组织：
   断点续传。处理逻辑与订单簿完全不同，故独立成模块。踩坑与决策史见
   `binance_vision/docs/binance_vision_lessons.md`。
 
+## 已发布的数据（下游项目直接取，不用跑管线）
+
+按月切好的 parquet 已经发布在本仓库的 GitHub Release，覆盖 `2025-07-01 ~ 2026-10-20`
+的 1 分钟粒度（UTC，Int64 毫秒时间戳）：
+
+| Release | 内容 | 资产命名 | 体量 |
+|---|---|---|---|
+| `vision-base` | K线 + 基差 + 合约 metrics 宽表（BTCUSDT / ETHUSDT，19 列） | `{SYMBOL}_base_features_{YYYY-MM}.parquet` | 54 MB / 32 个 |
+| `data-merged` | L2 订单簿分钟快照（futures + spot） | `{exchange}_minute_band[_mid]_{YYYY-MM}.parquet` | 10.5 GB / 64 个 |
+| `data-{YYYY-MM}` | 重建中间态（每日 zip，**消费端用不到**） | `{YYYY-MM-DD}.zip` | ~10 GB |
+
+一行取数：
+
+```bash
+python tools/fetch_release.py --tag vision-base --pattern 'BTCUSDT_*' --dest ./data/vision
+python tools/fetch_release.py --tag data-merged --pattern '*minute_band_mid_*' --dest ./data/ob
+```
+
+**schema、时间对齐口径、整合示例、踩坑清单见[`DATA_ACCESS.md`](DATA_ACCESS.md)**。
+其中最要紧的一条：K 线侧 `close_time` 与订单簿侧 `bucket` 差**一分钟**
+（`bucket == close_time - 60000`），写漏了不会报错，只会静默错位。
+
 ## 全链路一键（推荐）
 
 `run_all_cloud.sh` 串起两个模块的完整下载与处理，每步断点续传，中断后重跑同一条
@@ -62,6 +84,9 @@ python orderbook/merge_monthly.py --dest-root orderbook/data
 > 重建模式：默认 **dense**（零 caveat 参照实现）。`pipeline.py` / `build_minute_snapshots.py`
 > 的 `--mode` 可切换为 `sparse`（省内存/提速，自动回退 dense）；`run_all_cloud.sh`
 > 用 `MODE=dense|sparse` 环境变量控制（默认 dense）。产物完全一致（带内逐帧相等）。
+>
+> 在 **Kaggle** 上跑本模块并归档到 Kaggle Dataset 的完整步骤见
+> `orderbook/docs/kaggle_runbook.md`（含断点续传、跨会话持久化、发布前校验门禁设计）。
 
 ## binance_vision 模块
 
