@@ -1,0 +1,10 @@
+{
+  "id": "byh850515/orderbook-merge",
+  "title": "Orderbook Merge",
+  "code_file": "merge_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_internet_enabled": true,
+  "enable_gpu": false,
+  "enable_tpu": false
+}

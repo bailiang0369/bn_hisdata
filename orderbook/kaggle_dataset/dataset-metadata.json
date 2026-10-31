@@ -1,0 +1,6 @@
+{
+  "title": "Orderbook Minute Snapshots (resumable build)",
+  "id": "byh850515/orderbook-data",
+  "licenses": [{"name": "CC0-1.0"}],
+  "description": "Binance orderbook minute snapshots (dense reconstruction), binance_futures & binance_spot. Daily outputs persisted here so the build kernel can resume across runs (timeout-safe)."
+}

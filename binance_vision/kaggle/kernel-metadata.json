@@ -1,0 +1,10 @@
+{
+  "id": "byh850515/vision-base-features",
+  "title": "Vision Base Features",
+  "code_file": "vision_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_internet_enabled": true,
+  "enable_gpu": false,
+  "enable_tpu": false
+}
