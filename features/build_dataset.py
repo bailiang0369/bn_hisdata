@@ -21,9 +21,10 @@ merged 里保留为一行（vision 有该分钟），ob_* 列置 null 并带 ob_
 
 校验门禁（写盘前，不通过即退出）
 --------------------------------
-1. 覆盖：merged 中 ob_mid 非空行数 >= vision 行数 * 0.999
-2. 主键：close_time 严格 60s 递增、无重复
-3. 基差：futures/spot 两边 mid 偏差 >1% 的行占比 < 0.5%（防止某边接错文件/错位；
+1. 主键：close_time 严格 60s 递增、无重复（对齐错位的硬证据）
+   （覆盖率只报告不拦截：ob_mid 缺失是源端断流/单边有量/上游断档的正常结果，
+    见 feature_spec §7。报告字段 ob_coverage / ob_missing / ob_missing_days）
+2. 基差：futures/spot 两边 mid 偏差 >1% 的行占比 < 0.5%（防止某边接错文件/错位；
    极端行情短暂脱钩会产生个位数真实离群行，实测 2025-10 有 11 行 ≈0.02%，不拦）
 
 用法
@@ -201,9 +202,16 @@ def validate(df: pl.DataFrame, n_vision: int) -> dict:
     assert rep["dup_close_time"] == 0, "close_time 重复"
 
     if "ob_f_mid" in df.columns:
-        cover = df["ob_f_mid"].is_not_null().sum()
-        rep["ob_coverage"] = round(cover / n_vision, 6)
-        assert rep["ob_coverage"] >= 0.999, f"ob 覆盖不足: {rep['ob_coverage']}"
+        # 覆盖率只报告、不设门禁：源端断流、单边有量、上游某天 orderbook 缺失都会留下
+        # ob_mid=null 的分钟（feature_spec §7，建模前统一 drop），属正常态；
+        # 对齐是否错位由上面两项保证（close_time 严格 60s 无重复）与下面基差占比。
+        miss = df["ob_f_mid"].is_null()
+        n_miss = int(miss.sum())
+        rep["ob_coverage"] = round(1 - n_miss / n_vision, 6)
+        rep["ob_missing"] = n_miss
+        if n_miss:
+            rep["ob_missing_days"] = int(
+                (df["close_time"].filter(miss) // 86_400_000).n_unique())
     if "ob_s_mid" in df.columns and "ob_f_mid" in df.columns:
         spread_bad = df.filter(
             pl.col("ob_f_mid").is_not_null() & pl.col("ob_s_mid").is_not_null()
