@@ -79,8 +79,13 @@ def load_rolled(l1_glob: str, prefix: str) -> pl.DataFrame:
     if not files:
         raise SystemExit(f"没有 L1 文件匹配 {l1_glob}")
     log(f"{prefix} L1 files: {len(files)}")
-    df = pl.concat([pl.scan_parquet(f) for f in files],
-                   how="vertical_relaxed").collect().sort("close_time")
+    lfs = [pl.scan_parquet(f) for f in files]
+    # 各月 L1 的列顺序可能不同（极端行情缺某个价位箱时，补的 null 列被排到末尾）。
+    # lazy 下 vertical_relaxed 在 collect 时仍会报 "schema names differ"，
+    # 所以显式按首文件的列顺序 select 对齐，再拼接，最稳。
+    base_cols = lfs[0].collect_schema().names()
+    lfs = [lf.select(base_cols) for lf in lfs]
+    df = pl.concat(lfs).collect().sort("close_time")
     df = _reindex(df)
     log(f"{prefix} after reindex: {df.height:,} rows, missing={df['ob_missing'].sum():,}")
     df = build_l2(df)
@@ -219,8 +224,9 @@ def main() -> None:
         raise SystemExit(f"没有 vision 文件匹配 {args.vision}")
     log(f"vision files: {len(vision_files)}")
 
-    v_all = pl.concat([pl.scan_parquet(f) for f in vision_files],
-                      how="vertical_relaxed").collect().sort("close_time")
+    v_lfs = [pl.scan_parquet(f) for f in vision_files]
+    v_base = v_lfs[0].collect_schema().names()
+    v_all = pl.concat([lf.select(v_base) for lf in v_lfs]).collect().sort("close_time")
     v_all = _amplitude(v_all)  # 全窗口算振幅区间 + 30m 滚动均值，跨月不截断
 
     fut = load_rolled(args.fut, "ob_f_")
