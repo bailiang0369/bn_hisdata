@@ -113,14 +113,14 @@ def _amplitude(v: pl.DataFrame) -> pl.DataFrame:
     rng = v.with_columns(ts.alias("_ts")).rolling(index_column="_ts", period=AMP_WIN).agg(
         (pl.col("high").max() - pl.col("low").min()).alias("_amp5")
     ).drop("_ts")
-    v = v.hstack(rng)
+    v = pl.concat([v, rng], how="horizontal")
     v = v.with_columns((pl.col("_amp5") / pl.col("close") * 1e4).alias("amp_5m_bps"))
 
     mean = v.with_columns(ts.alias("_ts")).rolling(index_column="_ts",
                                                     period=AMP_MEAN_WIN).agg(
         pl.col("amp_5m_bps").mean().alias("amp_mean_30m_bps")
     ).drop("_ts")
-    return v.hstack(mean).drop("_amp5")
+    return pl.concat([v, mean], how="horizontal").drop("_amp5")
 
 
 def _cum(x: pl.Expr, side: str) -> pl.Expr:

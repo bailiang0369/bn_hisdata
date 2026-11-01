@@ -64,7 +64,7 @@ def _add_rolling(df: pl.DataFrame, label: str, period: str) -> pl.DataFrame:
         pl.col("ob_spread_bps").std(ddof=1).alias(f"ob_spread_std_{label}"),
         pl.col("_impact").mean().alias(f"ob_impact_mean_{label}"),
     ).drop("_ts")
-    return df.hstack(agg)
+    return pl.concat([df, agg], how="horizontal")
 
 
 def _sanitize(df: pl.DataFrame) -> pl.DataFrame:
