@@ -109,8 +109,8 @@ def months() -> list[str]:
     return out
 
 
-def download(url: str, dst: Path) -> Path:
-    """Range 续传下载；已完整则跳过。"""
+def download(url: str, dst: Path, optional: bool = False) -> Path | None:
+    """Range 续传下载；已完整则跳过。optional=True 时 404 返回 None（用于"可选复用"）。"""
     size = None
     if dst.exists() and dst.suffix == ".parquet":
         return dst  # 已完整（下游约定：parquet 存在即完整）
@@ -122,6 +122,8 @@ def download(url: str, dst: Path) -> Path:
             mode = "ab"
         elif r.status_code in (200, 206):
             mode = "wb"
+        elif optional and r.status_code == 404:
+            return None
         else:
             r.raise_for_status()
         with open(tmp, mode) as f:
@@ -221,6 +223,10 @@ def main():
             mid = OB / f"{ex}_minute_band_mid_{m}.parquet"
             out = L1 / f"ob_features_{ex}_{m}.parquet"
             if out.exists():
+                continue
+            # 优先复用 Release 上已算好的 L1（重跑时省掉重新下载 band + 聚合）
+            if download(f"{DL_BASE}/ob-features/{out.name}", out, optional=True) is not None:
+                print(f"[{m}] reuse cached L1 {ex}", flush=True)
                 continue
             print(f"[{m}] download {ex} band ...", flush=True)
             download(f"{DL_BASE}/data-merged/{band.name}", band)
