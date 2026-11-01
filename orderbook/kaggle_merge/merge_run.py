@@ -24,8 +24,11 @@ def _secret(name: str) -> str:
     if v:
         return v
     try:
-        from kaggle_secrets import UserSecretClient
-        v = UserSecretClient().get_secret(name)
+        try:
+            from kaggle_secrets import UserSecretsClient as _Client
+        except ImportError:
+            from kaggle_secrets import UserSecretClient as _Client
+        v = _Client().get_secret(name)
         if v:
             return v
     except Exception:  # noqa: BLE001 - 非 Kaggle 环境 / 未 attach 该 secret

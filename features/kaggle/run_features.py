@@ -55,15 +55,43 @@ for p in (OB, VIS, L1, MERGED):
 def _secret(name: str) -> str:
     v = os.environ.get(name)
     if v:
+        print(f"[secret] {name}: from env", flush=True)
         return v
     try:
-        from kaggle_secrets import UserSecretClient
-        v = UserSecretClient().get_secret(name)
-        if v:
-            return v
-    except Exception:  # noqa: BLE001
-        pass
-    raise SystemExit(f"missing secret: {name}")
+        try:
+            from kaggle_secrets import UserSecretsClient as _Client
+        except ImportError:
+            from kaggle_secrets import UserSecretClient as _Client
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            f"missing secret: {name} (cannot import kaggle_secrets client: "
+            f"{type(exc).__name__}: {exc})"
+        )
+    try:
+        client = _Client()
+        v = client.get_secret(name)
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            f"missing secret: {name} (get_secret raised "
+            f"{type(exc).__name__}: {exc})"
+        )
+    if not v:
+        # 诊断：尽量列出客户端能看到的 secret 名，帮定位 label 不匹配 / 未 attach
+        avail = None
+        for attr in ("get_secrets", "secrets", "list_secrets"):
+            fn = getattr(client, attr, None)
+            if fn is None:
+                continue
+            try:
+                avail = fn() if callable(fn) else fn
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        raise SystemExit(
+            f"missing secret: {name} (empty value; available={avail})"
+        )
+    print(f"[secret] {name}: from kaggle_secrets", flush=True)
+    return v
 
 
 GH_TOKEN = _secret("GH_TOKEN")
