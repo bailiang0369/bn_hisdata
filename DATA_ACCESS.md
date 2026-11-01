@@ -19,6 +19,8 @@
 | `vision-base` | 32 个 parquet | `{SYMBOL}_base_features_{YYYY-MM}.parquet` | 54 MB | **主用**。K线+基差+合约 metrics 的 1 分钟宽表 |
 | `data-merged` | 64 个 parquet | `{exchange}_minute_band_{YYYY-MM}.parquet`<br>`{exchange}_minute_band_mid_{YYYY-MM}.parquet` | 10.5 GB | **主用**。L2 订单簿的分钟级窄带快照 |
 | `data-{YYYY-MM}` | 每日 zip | `{YYYY-MM-DD}.zip` | 16 个月，~10 GB | 重建的**中间态**（每日 band+mid + 原始小时文件），正常消费**不需要** |
+| `ob-features` | 32 个 parquet | `ob_features_{exchange}_{YYYY-MM}.parquet` | 约 100 MB | 订单簿 L1 截面特征（中间态，供 merged 重建） |
+| `merged-features` | 17 个 parquet | `merged_BTCUSDT_{YYYY-MM}.parquet`（逐月）<br>`BTCUSDT.parquet`（全窗口单文件，**最终交付**） | 约 200 MB | **主用**。订单簿 + vision 合并宽表 |
 
 - `SYMBOL`：`BTCUSDT` / `ETHUSDT`
 - `exchange`：`binance_futures`（U 本位合约）/ `binance_spot`（现货）
@@ -108,7 +110,9 @@ def fetch(tag: str, name: str, dest: pathlib.Path) -> pathlib.Path:
 
 - **没有 `open_time`**，只有 `close_time`；要按 bar 起点索引得自己 `close_time - 60000`。
 - 这是 `--no-agg` 的 **base** 表，**不含** aggTrades 微观结构列（`um_agg_*`、`spot_agg_*`、
-  `rv_dominance` 共 20 列）。需要那些列得重跑第二阶段的 master 表，当前 Release 里没有。
+  `rv_dominance` 共 20 列）。**这是有意的（2026-11 决策）**：aggTrades 微观特征虽独特，
+  但对整体增益很小、且逐笔数据下载/处理成本高，性价比低，故不做。OHLC / 主动买卖量的
+  衍生特征工程一律下沉到下游项目（见 §3.3 的合并宽表）。
 - 末 6 列（`sum_open_interest` 起）源端是 **5 分钟一档**，已被前向填充到 1 分钟——
   相邻 5 根 bar 这几个值相同，**不要当 1 分钟独立信息**用。
 
@@ -146,6 +150,19 @@ def fetch(tag: str, name: str, dest: pathlib.Path) -> pathlib.Path:
   `inner join` 丢 **21/89 279 = 0.024%** 的分钟。
 - vision 侧的 metrics 列也有零星空值（`count_toptrader_long_short_ratio` 约 0.5%，
   其余 metrics 列 ≈0），来源是源端缺档，不是 join 造成的。
+
+### 3.3 `merged-features`：订单簿 + vision 合并宽表（最终交付）
+
+- `BTCUSDT.parquet`：**全窗口单文件**，下游项目直接用这个（推荐）。
+- `merged_BTCUSDT_{YYYY-MM}.parquet`：逐月中间态，供单月消费 / 增量重跑。
+
+列 = vision-base 全部 19 列 + 订单簿衍生特征（`ob_f_*` / `ob_s_*` 前缀 + 跨市场
+`ob_basis_bps` 等 + 振幅 `amp_*`/`ob_amp_*` + 攻防 `atk_*`）。完整列清单与口径见
+`features/docs/feature_spec.md`。
+
+- 主键 `close_time`，逐分钟无缝；订单簿侧缺分钟的 `ob_*` 置 null 并打 `ob_missing=1`。
+- 这是**特征原料底座**：OHLC / 主动买卖量的衍生特征工程**不在本仓库做**，下游项目
+  在此底座上自由构造（见 §3.1 的 aggTrades 决策与边界）。
 
 ---
 
@@ -291,6 +308,7 @@ assert k.select(pl.col("bucket").diff().drop_nulls().max()).collect().item() == 
 | `vision-base` | `binance_vision/kaggle/vision_run.py`<br>`binance_vision/run_base_table_cloud.sh` | Kaggle 内核 `byh850515/vision-base-features`；拉 klines/metrics → `build_master_features.py --no-agg` → 按月切 → 传 Release |
 | `data-YYYY-MM` | `orderbook/kaggle/run_orderbook.py` | 逐天 `pipeline.py` → 打包 `{date}.zip` 上传，支持断点续传 |
 | `data-merged` | `orderbook/kaggle_merge/merge_run.py` | 拉每日 zip → `merge_monthly.py` → 传 `data-merged` |
+| `ob-features`<br>`merged-features` | `features/kaggle/run_features.py` | 拉 vision-base + data-merged → `ob_features.py` 算 L1 → `build_dataset.py` 合并 → 传 `ob-features`（逐月 L1）与 `merged-features`（逐月 + 单文件 `BTCUSDT.parquet`） |
 
 - 凭据一律走环境变量或 Kaggle Secrets（`GH_TOKEN` / `CHD_API_KEY` / `KAGGLE_USERNAME` /
   `KAGGLE_KEY`），**代码里不留密钥**（仓库是 public）。
