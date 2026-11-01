@@ -86,6 +86,8 @@ def load_rolled(l1_glob: str, prefix: str) -> pl.DataFrame:
     base_cols = lfs[0].collect_schema().names()
     lfs = [lf.select(base_cols) for lf in lfs]
     df = pl.concat(lfs).collect().sort("close_time")
+    # 月度 L1 在边界重叠（每月文件含上月最后一分钟），按 close_time 去重
+    df = df.unique(subset=["close_time"], keep="last")
     df = _reindex(df)
     log(f"{prefix} after reindex: {df.height:,} rows, missing={df['ob_missing'].sum():,}")
     df = build_l2(df)
@@ -227,6 +229,7 @@ def main() -> None:
     v_lfs = [pl.scan_parquet(f) for f in vision_files]
     v_base = v_lfs[0].collect_schema().names()
     v_all = pl.concat([lf.select(v_base) for lf in v_lfs]).collect().sort("close_time")
+    v_all = v_all.unique(subset=["close_time"], keep="last")
     v_all = _amplitude(v_all)  # 全窗口算振幅区间 + 30m 滚动均值，跨月不截断
 
     fut = load_rolled(args.fut, "ob_f_")
