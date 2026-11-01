@@ -79,7 +79,8 @@ def load_rolled(l1_glob: str, prefix: str) -> pl.DataFrame:
     if not files:
         raise SystemExit(f"没有 L1 文件匹配 {l1_glob}")
     log(f"{prefix} L1 files: {len(files)}")
-    df = pl.concat([pl.scan_parquet(f) for f in files]).collect().sort("close_time")
+    df = pl.concat([pl.scan_parquet(f) for f in files],
+                   how="vertical_relaxed").collect().sort("close_time")
     df = _reindex(df)
     log(f"{prefix} after reindex: {df.height:,} rows, missing={df['ob_missing'].sum():,}")
     df = build_l2(df)
@@ -218,7 +219,8 @@ def main() -> None:
         raise SystemExit(f"没有 vision 文件匹配 {args.vision}")
     log(f"vision files: {len(vision_files)}")
 
-    v_all = pl.concat([pl.scan_parquet(f) for f in vision_files]).collect().sort("close_time")
+    v_all = pl.concat([pl.scan_parquet(f) for f in vision_files],
+                      how="vertical_relaxed").collect().sort("close_time")
     v_all = _amplitude(v_all)  # 全窗口算振幅区间 + 30m 滚动均值，跨月不截断
 
     fut = load_rolled(args.fut, "ob_f_")
