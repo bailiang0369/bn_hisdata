@@ -52,7 +52,12 @@ for p in (OB, VIS, L1, MERGED):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def _secret(name: str) -> str:
+def _secret(name: str):
+    """尝试从 env / Kaggle Secrets 取凭据；取不到返回 None（不中断）。
+
+    这样内核没有 secret 也能跑完全部计算，产物留在 /kaggle/working（Kaggle output），
+    由本地下载后用本地 token 上传——从而 `kaggle kernels push` 可一键触发，无需网页挂 secret。
+    """
     v = os.environ.get(name)
     if v:
         print(f"[secret] {name}: from env", flush=True)
@@ -63,39 +68,25 @@ def _secret(name: str) -> str:
         except ImportError:
             from kaggle_secrets import UserSecretClient as _Client
     except Exception as exc:  # noqa: BLE001
-        raise SystemExit(
-            f"missing secret: {name} (cannot import kaggle_secrets client: "
-            f"{type(exc).__name__}: {exc})"
-        )
+        print(f"[secret] {name}: kaggle_secrets unavailable "
+              f"({type(exc).__name__}) -> 上传将跳过，产物留在 output", flush=True)
+        return None
     try:
-        client = _Client()
-        v = client.get_secret(name)
+        v = _Client().get_secret(name)
     except Exception as exc:  # noqa: BLE001
-        raise SystemExit(
-            f"missing secret: {name} (get_secret raised "
-            f"{type(exc).__name__}: {exc})"
-        )
+        print(f"[secret] {name}: get_secret failed ({type(exc).__name__}) "
+              f"-> 上传将跳过，产物留在 output", flush=True)
+        return None
     if not v:
-        # 诊断：尽量列出客户端能看到的 secret 名，帮定位 label 不匹配 / 未 attach
-        avail = None
-        for attr in ("get_secrets", "secrets", "list_secrets"):
-            fn = getattr(client, attr, None)
-            if fn is None:
-                continue
-            try:
-                avail = fn() if callable(fn) else fn
-                break
-            except Exception:  # noqa: BLE001
-                continue
-        raise SystemExit(
-            f"missing secret: {name} (empty value; available={avail})"
-        )
+        print(f"[secret] {name}: empty -> 上传将跳过，产物留在 output", flush=True)
+        return None
     print(f"[secret] {name}: from kaggle_secrets", flush=True)
     return v
 
 
 GH_TOKEN = _secret("GH_TOKEN")
-HDRS = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+HDRS = {"Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github+json"} if GH_TOKEN else {}
 
 
 def months() -> list[str]:
@@ -170,6 +161,8 @@ def list_assets(rid):
 
 
 def upload(release_tag: str, fp: Path):
+    if not GH_TOKEN:
+        return "skip(no-token)"
     rid = ensure_release(release_tag)
     if not rid:
         raise SystemExit(f"cannot create release {release_tag}")
@@ -186,6 +179,8 @@ def upload(release_tag: str, fp: Path):
 def upload_replace(release_tag: str, fp: Path):
     """覆盖式上传：最终交付的单文件每次都要重新生成（新增月份后内容会变），
     所以先删旧资产再传，不能像月度文件那样 skip。"""
+    if not GH_TOKEN:
+        return "skip(no-token)"
     rid = ensure_release(release_tag)
     if not rid:
         raise SystemExit(f"cannot create release {release_tag}")
@@ -269,6 +264,11 @@ def main():
     print(f"final: {final.name} {df.height:,} rows x {df.width} cols "
           f"{final.stat().st_size / 1e6:.1f} MB", flush=True)
     print(f"upload {final.name}", upload_replace("merged-features", final), flush=True)
+    # 清理中间目录，让 Kaggle output 只保留最终产物（merged + BTCUSDT.parquet）
+    import shutil
+    for d in (L1, OB, VIS):
+        shutil.rmtree(d, ignore_errors=True)
+    print(f"产物: {MERGED}/*.parquet + {final}", flush=True)
     print("FEATURES DONE", flush=True)
 
 
