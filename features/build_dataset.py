@@ -23,7 +23,8 @@ merged 里保留为一行（vision 有该分钟），ob_* 列置 null 并带 ob_
 --------------------------------
 1. 覆盖：merged 中 ob_mid 非空行数 >= vision 行数 * 0.999
 2. 主键：close_time 严格 60s 递增、无重复
-3. 基差：futures/spot 两边 mid 偏差 < 1%（防止某边接错文件/错位）
+3. 基差：futures/spot 两边 mid 偏差 >1% 的行占比 < 0.5%（防止某边接错文件/错位；
+   极端行情短暂脱钩会产生个位数真实离群行，实测 2025-10 有 11 行 ≈0.02%，不拦）
 
 用法
 ----
@@ -209,7 +210,10 @@ def validate(df: pl.DataFrame, n_vision: int) -> dict:
             & (((pl.col("ob_f_mid") - pl.col("ob_s_mid")) / pl.col("ob_s_mid")).abs() > 0.01)
         ).height
         rep["basis_outliers"] = spread_bad
-        assert spread_bad == 0, f"futures/spot mid 偏差 >1% 的行: {spread_bad}"
+        # 极端行情下现货/合约短暂脱钩会产生少量真实 >1% 基差（实测 2025-10 有 11 行 ≈0.02%），
+        # 不能一票否决；只有占比超过 0.5%（错位/接错文件的量级）才中断。
+        limit = max(50, int(n_vision * 0.005))
+        assert spread_bad <= limit, f"futures/spot mid 偏差 >1% 的行过多: {spread_bad} > {limit}"
     return rep
 
 
