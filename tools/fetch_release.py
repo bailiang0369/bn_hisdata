@@ -70,7 +70,13 @@ def list_assets(tag: str) -> list[dict]:
 
 
 def download(asset: dict, dest_dir: Path) -> tuple[str, str, int]:
-    """下载单个资产；已完整则跳过。返回 (name, 状态, 字节数)。"""
+    """下载单个资产；已完整则跳过，已下了一截则续传。返回 (name, 状态, 字节数)。
+
+    GitHub release 资产支持 Range 请求（206），所以中断后重跑会从 `.part`
+    的当前长度续传，而不是从头再来——大文件（月度 band 300+ MB）在慢网络上
+    很容易被中断，没有续传基本下不完。服务端忽略 Range 时返回 200，此时
+    从 0 重写（不能 append，否则是两份拼接的垃圾）。
+    """
     name = asset["name"]
     dst = dest_dir / name
     size = int(asset["size"])
@@ -78,16 +84,32 @@ def download(asset: dict, dest_dir: Path) -> tuple[str, str, int]:
         return name, "skip", size
 
     tmp = dst.with_suffix(dst.suffix + ".part")
-    with requests.get(asset["browser_download_url"], stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
+    start = tmp.stat().st_size if tmp.exists() else 0
+    headers = {"Range": f"bytes={start}-"} if start else None
+    with requests.get(asset["browser_download_url"], stream=True,
+                      timeout=300, headers=headers) as r:
+        if start and r.status_code == 206:
+            mode, base = "ab", start
+        elif r.status_code in (200, 206):
+            mode, base = "wb", 0
+        else:
+            r.raise_for_status()
+            return name, f"HTTP{r.status_code}", start
+        total = base + int(r.headers.get("Content-Length", 0))
+        done, tick = base, base
+        with open(tmp, mode) as f:
             for chunk in r.iter_content(1 << 20):
                 f.write(chunk)
+                done += len(chunk)
+                if done - tick >= 20 << 20:  # 每 20MB 打一次进度，别刷屏
+                    tick = done
+                    print(f"    {name}: {done / 1e6:.0f}/{size / 1e6:.0f} MB", flush=True)
     got = tmp.stat().st_size
     if got != size:
-        tmp.unlink(missing_ok=True)
-        return name, f"SIZE MISMATCH ({got} != {size})", got
+        # 保留 .part，下次续传；只有"比目标还大"才是真错
+        return name, f"INCOMPLETE ({got} != {size}), rerun to resume", got
     tmp.replace(dst)
+    print(f"    {name}: done ({total / 1e6:.0f} MB)")
     return name, "ok", size
 
 
