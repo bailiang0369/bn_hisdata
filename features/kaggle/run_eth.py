@@ -5,24 +5,26 @@
 而 ETH 的 band 在 Release 上不存在，必须从 CryptoHFTData 原始 L2 重新构建。
 
 MODE（环境变量）：
-  probe（默认）: 只探测 CryptoHFTData 上 ETHUSDT 是否存在，打印样本，不下载。
-  build       : 逐日构建 band → 月度 → L1 → merged → /kaggle/working/eth_dataset/{SYMBOL}.parquet
+  probe（默认）: 只精确探测 `{SYMBOL}_orderbook` 键是否存在，打印大小，不下载。
+  smoke       : 探测 + 构建 MAX_DAYS 天 band/L1（端到端验证管线与耗时）。
+  build       : 全量构建 band → 月度 → L1 → merged → /kaggle/working/eth_dataset/{SYMBOL}.parquet
 
 环境变量：
-  MODE=probe|build          默认 probe
+  MODE=probe|smoke|build    默认 probe
   OB_SYMBOL=ETHUSDT         目标标的
   START / END               日期范围，默认 2025-07-01 / 2026-10-20
-  MAX_DAYS=0                只处理前 N 天（0=全部；用于单次运行内控时长）
+  MAX_DAYS=0                smoke 处理天数（默认 2）；build 时为 0 表示全部
 
-需要 Kaggle Secret（或同名环境变量）：
-  CHD_API_KEY   CryptoHFTData API key（probe/build 必需）
-  GH_TOKEN      可选，未用（本内核不走 Release 断点续传）
+需要 CHD_API_KEY（本内核用 --env 注入到私有内核，不入公开仓库）。
 
-产物：/kaggle/working/eth_dataset/{SYMBOL}.parquet
-      在 Kaggle 内核输出页可直接 "Create Dataset" 发布。
+产物：/kaggle/working/eth_dataset/{SYMBOL}.parquet（内核输出页可 Create Dataset）
+中间产物一律放 /tmp，避免 /kaggle/working 过大导致 `kaggle kernels output` 卡死。
 """
 import os
 import sys
+import json
+import time
+import contextlib
 import subprocess
 from datetime import date, timedelta
 from pathlib import Path
@@ -32,12 +34,13 @@ GH_REPO = "bailiang0369/bn_hisdata"
 DL_BASE = f"https://github.com/{GH_REPO}/releases/download"
 
 WORK = Path("/kaggle/working")
-ROOT = WORK / "bn_hisdata"
+TMP = Path("/tmp")
+ROOT = TMP / "bn_hisdata"
 SYMBOL = os.environ.get("OB_SYMBOL", "ETHUSDT")
 START = os.environ.get("START", "2025-07-01")
 END = os.environ.get("END", "2026-10-20")
 MODE = os.environ.get("MODE", "probe").strip().lower()
-MAX_DAYS = int(os.environ.get("MAX_DAYS", "0"))
+MAX_DAYS = int(os.environ.get("MAX_DAYS", "2"))
 
 EXCHANGES = ("binance_futures", "binance_spot")
 
@@ -89,7 +92,6 @@ def ensure_repo() -> None:
 
 
 def download(url: str, dst: Path) -> bool:
-    """Range 续传；已完整则跳过。返回是否成功。"""
     import requests
 
     if dst.exists() and dst.stat().st_size > 0:
@@ -117,17 +119,11 @@ def download(url: str, dst: Path) -> bool:
         return False
 
 
-def probe() -> int:
-    """探测 CryptoHFTData 是否有目标标的，并与 BTC 做对照。"""
-    key = secret("CHD_API_KEY")
-    if not key:
-        log("缺少 CHD_API_KEY：请在 Kaggle 内核设置里 attach Secret（或设同名环境变量）")
-        return 3
+def _client(key: str):
     sys.path.insert(0, str(ROOT / "orderbook"))
     from download_orderbook_s3 import get_credentials, S3LiteClient  # noqa: E402
 
     creds = get_credentials(key)
-    bucket = creds["bucket"]
     cli = S3LiteClient(
         endpoint=creds["endpoint"],
         access_key_id=creds["credentials"]["access_key_id"],
@@ -137,46 +133,45 @@ def probe() -> int:
         timeout=300,
         max_attempts=3,
     )
+    return cli, creds["bucket"]
 
-    def ls(prefix: str):
-        try:
-            return cli.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=10).get("Contents", [])
-        except Exception as exc:  # noqa: BLE001
-            return [{"Key": f"ERR {repr(exc)[:100]}"}]
 
+def _ls(cli, bucket: str, prefix: str) -> list[dict]:
+    try:
+        return cli.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=20).get("Contents", [])
+    except Exception as exc:  # noqa: BLE001
+        return [{"Key": f"ERR {repr(exc)[:100]}", "Size": 0}]
+
+
+def probe(key: str) -> int:
+    """精确探测 {exchange}/{date}/{hour}/{SYMBOL}_orderbook 是否存在。"""
+    cli, bucket = _client(key)
     log(f"bucket={bucket}")
-    sample_days = ["2025-07-01", "2025-12-01", "2026-06-01", "2026-10-01"]
-    summary = {}
-    for d in sample_days:
-        for sym in ("BTCUSDT", SYMBOL):
-            hits = ls(f"binance_futures/{d}/00/{sym}")
+    sample = ["2025-07-01", "2026-01-15", "2026-10-15"]
+    found, missing = 0, 0
+    for d in sample:
+        for ex in EXCHANGES:
+            prefix = f"{ex}/{d}/00/{SYMBOL}_orderbook"
+            hits = _ls(cli, bucket, prefix)
             keys = [h.get("Key", "?") for h in hits]
-            summary[(d, sym)] = keys
-            log(f"futures {d} 00 {sym}: {len(keys)} hit(s)  {keys[:2]}")
-
-    for d in sample_days[:2]:
-        hits = ls(f"binance_spot/{d}/00/{SYMBOL}")
-        log(f"spot    {d} 00 {SYMBOL}: {len(hits)} hit(s)")
-
-    eth_hits = sum(len(v) for (d, s), v in summary.items() if s == SYMBOL)
-    btc_hits = sum(len(v) for (d, s), v in summary.items() if s == "BTCUSDT")
-    log("=" * 60)
-    log(f"结论：BTC hits={btc_hits}（对照，应 >0）；{SYMBOL} hits={eth_hits}")
-    if eth_hits:
-        log(f"✅ {SYMBOL} 数据存在，可以 MODE=build 构建")
-        return 0
-    log(f"❌ {SYMBOL} 在 CryptoHFTData 上不存在（或 key 无权限）→ 订单簿腿无法构建")
-    return 1
+            sizes = [h.get("Size", 0) for h in hits]
+            if keys and not keys[0].startswith("ERR"):
+                found += 1
+                log(f"✅ {ex} {d}: {keys}  size={sizes} ({sizes[0] / 1e6:.1f} MB)" if sizes else f"✅ {ex} {d}")
+            else:
+                missing += 1
+                log(f"❌ {ex} {d}: 无 {SYMBOL}_orderbook（hits={len(keys)}）")
+    res = {"symbol": SYMBOL, "bucket": bucket, "found": found, "missing": missing,
+           "sample": sample, "exchanges": list(EXCHANGES)}
+    WORK.mkdir(parents=True, exist_ok=True)
+    (WORK / "eth_probe.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"probe 结果：found={found} missing={missing}")
+    return 0 if found and not missing else 1
 
 
-def build() -> int:
-    """逐日构建 band → 月度 → L1 → merged → 单文件。"""
-    key = secret("CHD_API_KEY")
-    if not key:
-        log("缺少 CHD_API_KEY，无法下载原始 L2")
-        return 3
-
-    base = WORK / "eth"
+def build(key: str, max_days: int) -> int:
+    """逐日构建 band → 月度 → L1 → merged → 单文件。中间产物在 /tmp。"""
+    base = TMP / "eth"
     data, vis, monthly, l1, merged = (base / "data", base / "vision",
                                       base / "monthly", base / "l1", base / "merged")
     for p in (data, vis, monthly, l1, merged):
@@ -189,37 +184,46 @@ def build() -> int:
 
     env = dict(os.environ, OB_SYMBOL=SYMBOL, CHD_API_KEY=key)
 
-    # 2) 逐日构建 band（pipeline 会跳过已完成的日）
+    # 2) 逐日构建 band
     todo = days(START, END)
-    if MAX_DAYS:
-        todo = todo[:MAX_DAYS]
+    if max_days:
+        todo = todo[:max_days]
     log(f"构建 band：{len(todo)} 天（{todo[0]} ~ {todo[-1]}）")
+    t0 = time.time()
     for d in todo:
         sh([sys.executable, "orderbook/pipeline.py", "--date", d,
             "--download", "r2", "--mode", "dense", "--dest-root", str(data)],
            cwd=str(ROOT), env=env)
+    log(f"band 完成，用时 {time.time() - t0:.0f}s")
+
+    built = sorted(data.glob("*/binance_futures_minute_band.parquet"))
+    log(f"band 产物：{len(built)} 天，样本大小 "
+        f"{[round(p.stat().st_size / 1e6, 1) for p in built[:3]]} MB")
 
     # 3) 月度合并
     sh([sys.executable, "orderbook/merge_monthly.py",
         "--dest-root", str(data), "--out-dir", str(monthly)],
        cwd=str(ROOT), env=env)
 
-    # 4) 逐月 L1 截面特征
+    # 4) 逐月 L1
     for m in months(START, END):
         for ex in EXCHANGES:
             band = monthly / f"{ex}_minute_band_{m}.parquet"
             mid = monthly / f"{ex}_minute_band_mid_{m}.parquet"
             out = l1 / f"ob_features_{ex}_{m}.parquet"
-            if not band.exists() or not mid.exists():
-                log(f"[{m}] 缺 {ex} band/mid，跳过 L1")
-                continue
-            if out.exists():
+            if not band.exists() or not mid.exists() or out.exists():
                 continue
             sh([sys.executable, "features/ob_features.py",
                 "--band", str(band), "--mid", str(mid), "--out", str(out), "--force"],
                cwd=str(ROOT), env=env)
+    l1_files = sorted(l1.glob("ob_features_*.parquet"))
+    log(f"L1 产物：{len(l1_files)} 个")
 
-    # 5) 合并 vision + L1（全序列 reindex + 滚动 + 校验）
+    if max_days:
+        log("smoke 模式：跳过 build_dataset/拼接，只验证 band+L1 管线")
+        return 0 if built and l1_files else 1
+
+    # 5) 合并 vision + L1
     sh([sys.executable, "features/build_dataset.py",
         "--vision", str(vis / f"{SYMBOL}_base_features_*.parquet"),
         "--fut", str(l1 / "ob_features_binance_futures_*.parquet"),
@@ -227,36 +231,40 @@ def build() -> int:
         "--out-dir", str(merged)],
        cwd=str(ROOT), env=env)
 
-    # 6) 拼成单文件 → /kaggle/working/eth_dataset/
+    # 6) 拼单文件 → /kaggle/working/eth_dataset/
     import polars as pl
 
     files = sorted(merged.glob("merged_*.parquet"))
     if not files:
-        log("没有 merged 产物，构建失败")
+        log("没有 merged 产物")
         return 1
     out_dir = WORK / "eth_dataset"
     out_dir.mkdir(parents=True, exist_ok=True)
     final = out_dir / f"{SYMBOL}.parquet"
     log(f"concat {len(files)} 个月度文件 -> {final}")
     df = (pl.concat([pl.scan_parquet(f) for f in files], how="vertical_relaxed")
-          .unique(subset=["close_time"], keep="last")
-          .sort("close_time")
-          .collect())
+          .unique(subset=["close_time"], keep="last").sort("close_time").collect())
     df.write_parquet(final, compression="zstd")
-    log(f"DONE {final} {df.height:,} 行 x {df.width} 列 "
-        f"{final.stat().st_size / 1e6:.1f} MB")
-    log("在 Kaggle 输出页对 eth_dataset/ 执行 Create Dataset 即可发布")
+    log(f"DONE {final} {df.height:,} 行 x {df.width} 列 {final.stat().st_size / 1e6:.1f} MB")
     return 0
 
 
 def main() -> int:
     log(f"MODE={MODE} SYMBOL={SYMBOL} START={START} END={END} MAX_DAYS={MAX_DAYS}")
+    key = secret("CHD_API_KEY")
+    if not key:
+        log("缺少 CHD_API_KEY：用 --env CHD_API_KEY=... 注入，或 attach Kaggle Secret")
+        return 3
     ensure_repo()
     if MODE == "probe":
-        return probe()
-    if MODE == "build":
-        return build()
-    log(f"未知 MODE={MODE}（应为 probe|build）")
+        return probe(key)
+    if MODE in ("smoke", "build"):
+        rc = probe(key)
+        if rc != 0:
+            log("探测未通过，终止")
+            return rc
+        return build(key, MAX_DAYS if MODE == "smoke" else 0)
+    log(f"未知 MODE={MODE}")
     return 2
 
 
