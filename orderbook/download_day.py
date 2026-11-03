@@ -5,6 +5,7 @@
 """
 import argparse
 import http.client
+import os
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -14,7 +15,7 @@ import requests
 
 HERE = Path(__file__).resolve().parent
 API_BASE = "https://api.cryptohftdata.com/v1"
-SYMBOL = "BTCUSDT"
+SYMBOL = os.environ.get("OB_SYMBOL", "BTCUSDT")
 DATA_TYPE = "orderbook"
 NATIVE_ZSTD_CUTOVER_DATE = "2026-08-19"  # 之后为裸 .parquet，之前为 .parquet.zst
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"

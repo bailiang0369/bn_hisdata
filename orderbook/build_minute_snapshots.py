@@ -20,6 +20,7 @@ Usage:
     python build_minute_snapshots.py --date 2026-10-12 --exchange binance_spot
 """
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,9 @@ from pathlib import Path
 import polars as pl
 
 from ob_reconstruct import reconstruct_state, reconstruct_state_sparse
+
+# 标的可用环境变量覆盖（OB_SYMBOL）；默认 BTCUSDT，保持既有管线行为不变。
+SYMBOL = os.environ.get("OB_SYMBOL", "BTCUSDT")
 
 HERE = Path(__file__).resolve().parent
 START = time.time()
@@ -84,7 +88,7 @@ def main() -> None:
     args = ap.parse_args()
 
     root = Path(args.dest_root) / args.date / args.exchange
-    files = sorted(root.glob("*/BTCUSDT_orderbook.parquet"))
+    files = sorted(root.glob(f"*/{SYMBOL}_orderbook.parquet"))
     log(f"found {len(files)} hour files in {root} (mode={args.mode})")
     if not files:
         # 该天没有任何小时文件（全 404 / 下载失败 / 目录不存在）。用非零退出让

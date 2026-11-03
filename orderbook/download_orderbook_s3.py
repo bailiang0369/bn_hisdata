@@ -34,7 +34,8 @@ from s3lite import S3LiteClient, S3LiteError
 HERE = Path(__file__).resolve().parent
 API_BASE = "https://api.cryptohftdata.com/v1"
 EXCHANGES = ["binance_spot", "binance_futures"]
-SYMBOL = "BTCUSDT"
+# 标的可用环境变量覆盖（OB_SYMBOL）；默认 BTCUSDT，保持既有管线行为不变。
+SYMBOL = os.environ.get("OB_SYMBOL", "BTCUSDT")
 DATA_TYPE = "orderbook"
 # After this date objects are bare .parquet; before it they are .parquet.zst.
 NATIVE_ZSTD_CUTOVER_DATE = "2026-08-19"

@@ -39,7 +39,8 @@ GH_UPLOAD = "https://uploads.github.com"
 DL_BASE = f"https://github.com/{GH_REPO}/releases/download"
 
 START, END = "2025-07-01", "2026-10-20"
-SYMBOL = "BTCUSDT"
+# 标的可用环境变量覆盖（VISION_SYMBOL）；默认 BTCUSDT，保持既有行为不变。
+SYMBOL = os.environ.get("VISION_SYMBOL", "BTCUSDT")
 EXCHANGES = ("binance_futures", "binance_spot")
 
 WORK = Path("/kaggle/working")
@@ -239,7 +240,7 @@ def main():
 
     # 3) 全序列 rolling + 合并 + 校验（build_dataset 内部用 glob 展开月度文件）
     run("features/build_dataset.py",
-        "--vision", str(VIS / "BTCUSDT_base_features_*.parquet"),
+        "--vision", str(VIS / f"{SYMBOL}_base_features_*.parquet"),
         "--fut", str(L1 / "ob_features_binance_futures_*.parquet"),
         "--spot", str(L1 / "ob_features_binance_spot_*.parquet"),
         "--out-dir", str(MERGED))
@@ -248,8 +249,8 @@ def main():
     for fp in sorted(MERGED.glob("merged_*.parquet")):
         print(f"upload {fp.name}", upload("merged-features", fp), flush=True)
 
-    # 5) 合并成单个 BTCUSDT.parquet（最终交付）并覆盖上传
-    final = WORK / "BTCUSDT.parquet"
+    # 5) 合并成单个 {SYMBOL}.parquet（最终交付）并覆盖上传
+    final = WORK / f"{SYMBOL}.parquet"
     merged_files = sorted(MERGED.glob("merged_*.parquet"))
     if not merged_files:
         raise SystemExit("no merged_*.parquet to concat")
