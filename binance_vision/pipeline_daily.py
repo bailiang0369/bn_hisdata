@@ -69,6 +69,7 @@ BASE_COLS = ["close_time", "open", "high", "low", "close",
 # 一天本应 1440 根。源站确有残缺日（如 2020-02-19 只有 1085 根），低于 600 才认定为
 # 文件损坏；残缺但不至于丢弃的日子照收，断档由 check_frame 告警。
 MIN_ROWS_PER_DAY = 600
+EXPECTED_ROWS_PER_DAY = 1440   # 体检口径：一天完整应有多少根
 DEFAULT_START = date(2020, 1, 1)   # 数据源最早可用日（um 2019-12-31 起、spot 更早）；首次运行自动从这里回填
 
 YEARLY_RE = re.compile(r"^(?P<sym>[A-Z0-9]+USDT)_base_features_(?P<year>(?:19|20)\d{2})\.parquet$")
@@ -562,6 +563,39 @@ def cmd_backfill(args) -> int:
     return 0
 
 
+def cmd_audit(args) -> int:
+    """体检：每年行数/覆盖范围/缺口明细。只读，不改 release。"""
+    gh = GH(args.repo)
+    rid = gh.ensure_release(RELEASE_TAG, RELEASE_TITLE)
+    assets = gh.assets(rid)
+
+    for sym in _symbols(args):
+        years = _years_present(assets, sym)
+        log(f"\n=== {sym}（{len(years)} 个年度文件）===")
+        for y in sorted(years):
+            df = pl.read_parquet(io.BytesIO(gh.download(years[y])))
+            lo, hi = _date_of_ms(df["close_time"][0]), _date_of_ms(df["close_time"][-1])
+            have = dict((df.select((pl.col("close_time") - 1)
+                                   .cast(pl.Datetime("ms")).dt.date().alias("d"))
+                           .group_by("d").len()).iter_rows())
+            days = _daterange(lo, hi)
+            absent = [d for d in days if d not in have]
+            short = [(d, c) for d, c in sorted(have.items())
+                     if c < EXPECTED_ROWS_PER_DAY]
+            expect = len(days) * EXPECTED_ROWS_PER_DAY
+            log(f"  {y}: {df.height:,} 行 / 期望 {expect:,}"
+                f"（{df.height / expect:.4%}），{lo} ~ {hi}")
+            if absent:
+                log(f"    整日缺失 {len(absent)} 天: "
+                    + ", ".join(str(d) for d in absent[:15])
+                    + (" ..." if len(absent) > 15 else ""))
+            if short:
+                log(f"    不完整 {len(short)} 天: "
+                    + ", ".join(f"{d}({c})" for d, c in short[:15])
+                    + (" ..." if len(short) > 15 else ""))
+    return 0
+
+
 def cmd_prune_legacy(args) -> int:
     """删除旧月度资产。默认只列出；确认年度文件齐全后再加 --yes。"""
     gh = GH(args.repo)
@@ -636,7 +670,7 @@ def status_md(target: date, info: dict[str, dict]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("update", "backfill", "prune-legacy"))
+    ap.add_argument("cmd", choices=("update", "backfill", "audit", "prune-legacy"))
     ap.add_argument("--repo", default="bailiang0369/bn_hisdata")
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT")
     ap.add_argument("--date", default=None, help="update: 补到哪一天（YYYY-MM-DD）")
@@ -650,6 +684,8 @@ def main() -> int:
         return cmd_update(args)
     if args.cmd == "backfill":
         return cmd_backfill(args)
+    if args.cmd == "audit":
+        return cmd_audit(args)
     return cmd_prune_legacy(args)
 
 

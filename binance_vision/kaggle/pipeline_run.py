@@ -4,7 +4,7 @@
 只做 klines：um + spot 各 7 列 = 15 列，不碰 aggTrades / metrics / 订单簿。
 
 环境变量（推内核时用 --env 传，都有默认值）：
-    MODE=backfill|update   默认 backfill
+    MODE=backfill|update|audit   默认 backfill
     START=2020-01-01       backfill 起点
     END=                   backfill 终点，默认 UTC 昨天
     SYMBOLS=BTCUSDT,ETHUSDT
