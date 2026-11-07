@@ -1,0 +1,67 @@
+name: vision daily update
+
+# 每天把 UTC 昨天（或漏掉的若干天）的 1m K 线并入当年的年度 parquet 并覆盖发布，
+# 随后提交 DATA_STATUS.md。数据源 404（尚未发布）不失败，次日运行自愈。
+on:
+  schedule:
+    - cron: "17 6 * * *"        # UTC 06:17；Binance 日度 K 线通常 UTC 01:00-02:00 才发布
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "只补到这一天（YYYY-MM-DD）；留空 = UTC 昨天"
+        required: false
+        type: string
+      symbols:
+        description: "逗号分隔的标的，留空 = 脚本默认值"
+        required: false
+        type: string
+
+concurrency:
+  group: vision-daily
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 增量更新并发布
+        env:
+          TARGET_DATE: ${{ github.event.inputs.date }}
+          TARGET_SYMBOLS: ${{ github.event.inputs.symbols }}
+        run: |
+          ARGS=""
+          if [ -n "$TARGET_DATE" ]; then ARGS="$ARGS --date $TARGET_DATE"; fi
+          if [ -n "$TARGET_SYMBOLS" ]; then ARGS="$ARGS --symbols $TARGET_SYMBOLS"; fi
+          python binance_vision/pipeline_daily.py update $ARGS
+
+      - name: 提交数据状态
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$GITHUB_REF_NAME"
+          git add DATA_STATUS.md
+          if git diff --cached --quiet; then
+            echo "DATA_STATUS.md 无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "data: K 线更新至 $(date -u +%F)（自动）"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
