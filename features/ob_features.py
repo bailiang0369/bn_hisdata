@@ -30,7 +30,10 @@ mid  : bucket(Int64) best_bid best_ask mid spread（全部 Float64）
 --------
 所有距离统一为**相对 mid 的 bps**（`d = |px-mid|/mid*1e4`），所有量都是 BTC 枚数。
 这样跨交易所（futures tick 0.1 / spot tick 0.01，档位数差一个量级）和跨价位都可比。
-深度按 0-2 / 2-5 / 5-10 / 10-20 / 20-30 bps 分箱（b0..b4）。
+深度默认按 **vol8** 分箱：距离 / 当期 σ_t，边界 1 / 2 / 4 / 8 σ（v0..v4）。
+σ 中位数约 3.8bps、band 到 ±30bps（≈8σ），所以 1/2/4/8 正好铺满整个 band；
+单月实测桶占比最均衡（futures max 桶 .336 / 熵 .939，bps 口径为 .374 / .848）。
+固定 bps 口径（b0..b4）保留，用 `--bin-mode bps` 可复现历史结果。
 
 计算结构（避免把原始档位表展开成宽表）
 --------------------------------------
@@ -65,7 +68,8 @@ BIN_MODES = {
     # vol02：0.2/0.5/1/2 倍 sigma，贴价侧重（σ≈3.8bps 时 2σ≈7.6bps）
     "vol02": ((0.2, 0.5, 1.0, 2.0), ("v0", "v1", "v2", "v3", "v4")),
 }
-BIN_EDGES, BIN_NAMES = BIN_MODES["bps"]      # 默认口径，保持向后兼容
+DEFAULT_BIN_MODE = "vol8"                    # 生产口径：波动率倍数（见模块 docstring）
+BIN_EDGES, BIN_NAMES = BIN_MODES[DEFAULT_BIN_MODE]
 SIGMA_WINDOW = 30        # 波动尺度：过去 N 个 1 分钟对数收益的标准差
 SIGMA_FLOOR = 0.5        # sigma 下限（bps），防除零与极端放大
 T = time.time()
@@ -226,12 +230,14 @@ def _pivot_bins(bin_agg: pl.DataFrame, bin_names: tuple[str, ...]) -> pl.DataFra
 
 
 def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None,
-             bin_mode: str = "bps") -> pl.DataFrame:
+             bin_mode: str = DEFAULT_BIN_MODE) -> pl.DataFrame:
     """单个 band(+mid) 文件 -> 分钟截面特征表（主键 close_time）。
 
+    bin_mode="vol8"（默认）：按 `距离 / σ_t` 的波动率倍数分箱（v0..v4，1/2/4/8σ），
+    并多输出 `ob_sigma_bps`（当期 1 分钟波动尺度）。
+    bin_mode="vol"/"vol02"：同上但边界不同（0.5/1/2/4σ、0.2/0.5/1/2σ），仅作对照。
     bin_mode="bps"：历史口径，按固定 bps 距离分箱（b0..b4）。
-    bin_mode="vol"/"vol8"：按 `距离 / σ_t` 的波动率倍数分箱（v0..v4），并多输出
-    `ob_sigma_bps`（当期 1 分钟波动尺度）。所有口径都是 5 个桶、列数一致。
+    所有口径都是 5 个桶、列数一致。
 
     `limit_rows` 只用于本地冒烟测试：截取文件最前面的 N 行跑通逻辑，避免在
     本地对 1.5 亿行做聚合（那是 Kaggle 的活）。全量计算必须走流式引擎。
@@ -341,8 +347,9 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit-rows", type=int, default=None,
                     help="只读前 N 行做本地冒烟测试；不传则全量")
-    ap.add_argument("--bin-mode", choices=tuple(BIN_MODES), default="bps",
-                    help="bps=固定 bps；vol=0.5/1/2/4σ；vol8=1/2/4/8σ；vol02=0.2/0.5/1/2σ")
+    ap.add_argument("--bin-mode", choices=tuple(BIN_MODES), default=DEFAULT_BIN_MODE,
+                    help="vol8=1/2/4/8σ(默认/生产口径)；bps=固定 bps(历史)；"
+                         "vol=0.5/1/2/4σ；vol02=0.2/0.5/1/2σ")
     ap.add_argument("--force", action="store_true",
                     help="确认在本地跑全量（>256MB 的 band）。默认拒绝，避免占满本机")
     args = ap.parse_args()

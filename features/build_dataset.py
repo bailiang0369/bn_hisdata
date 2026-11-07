@@ -50,9 +50,11 @@ from ob_rolling import build_l2, _reindex, _sanitize
 T = time.time()
 MONTH_RE = re.compile(r"(\d{4}-\d{2})")
 
-# L1 深度分箱（bps）：与 ob_features.py 的 BIN_EDGES 对应 [0,2)[2,5)[5,10)[10,20)[20,30]
-DEPTH_BINS = (("b0", 0.0, 2.0), ("b1", 2.0, 5.0), ("b2", 5.0, 10.0),
-              ("b3", 10.0, 20.0), ("b4", 20.0, 30.0))
+# L1 深度分箱：与 ob_features.py 的默认 vol8 口径对应，边界是 σ 倍数
+# [0,1)[1,2)[2,4)[4,8)[8,∞) -> v0..v4。单位**不是 bps**：插值前要用 ob_f_sigma_bps
+# 把目标距离换算成 σ 倍数（见 _cum）。
+DEPTH_BINS = (("v0", 0.0, 1.0), ("v1", 1.0, 2.0), ("v2", 2.0, 4.0), ("v3", 4.0, 8.0))
+DEPTH_TAIL = ("v4", 8.0)     # 8σ 以上：band 到 ±30bps 已基本封顶
 BAND_BPS = 30.0      # band ±0.3% 的上界，振幅倍数超过它就超出快照
 AMP_WIN = "5m"       # 振幅的区间长度：近 5 分钟的 high - low
 AMP_MEAN_WIN = "30m"  # 对 5 分钟振幅做滚动均值的窗口
@@ -86,6 +88,12 @@ def load_rolled(l1_glob: str, prefix: str) -> pl.DataFrame:
     # lazy 下 vertical_relaxed 在 collect 时仍会报 "schema names differ"，
     # 所以显式按首文件的列顺序 select 对齐，再拼接，最稳。
     base_cols = lfs[0].collect_schema().names()
+    # 口径守卫：v0..v4 是 vol8 口径的标志列。混用 bps 口径的旧 L1 会让 _cum
+    # 静默错位（列名对不上会报错，但对上了就是单位错），所以进流程前先卡住。
+    if "ob_q_bid_v0" not in base_cols:
+        raise SystemExit(
+            f"{prefix} L1 不是 vol8 口径（schema 里没有 ob_q_bid_v0）。\n"
+            "请用 features/ob_features.py --bin-mode vol8 重算 L1。")
     lfs = [lf.select(base_cols) for lf in lfs]
     df = pl.concat(lfs).collect().sort("close_time")
     # 月度 L1 在边界重叠（每月文件含上月最后一分钟），按 close_time 去重
@@ -134,18 +142,24 @@ def _amplitude(v: pl.DataFrame) -> pl.DataFrame:
 
 
 def _cum(x: pl.Expr, side: str) -> pl.Expr:
-    """累计深度：mid 到距离 x(bps) 内的挂单量，按 L1 固定分箱线性插值。
+    """累计深度：mid 到距离 x(bps) 内的挂单量，按 L1 分箱线性插值。
+
+    L1 是 vol8 口径，v0..v4 的边界是 σ 倍数，所以先把 x 换算成 σ 倍数
+    （x / ob_f_sigma_bps）再在 σ 空间插值。σ 缺失（上游断档/首月 warmup）时
+    整行返回 null，下游 ob_amp_obi_* 一并置 null，不臆造深度。
 
     返回 futures 侧的累计深度表达式（side = 'bid' | 'ask'）。
     """
-    acc = pl.lit(0.0)
+    xs = x / pl.col("ob_f_sigma_bps")
+    tail, tail_lo = DEPTH_TAIL
+    acc = pl.when(xs >= tail_lo).then(pl.col(f"ob_f_q_{side}_{tail}")).otherwise(0.0)
     for bn, lo, hi in DEPTH_BINS:
         q = pl.col(f"ob_f_q_{side}_{bn}")
         acc = (acc
-               + pl.when(x >= hi).then(q).otherwise(0.0)
-               + pl.when((x > lo) & (x < hi)).then(q * (x - lo) / (hi - lo))
+               + pl.when(xs >= hi).then(q).otherwise(0.0)
+               + pl.when((xs > lo) & (xs < hi)).then(q * (xs - lo) / (hi - lo))
                .otherwise(0.0))
-    return acc
+    return pl.when(pl.col("ob_f_sigma_bps").is_null()).then(None).otherwise(acc)
 
 
 def _atkdef_features(df: pl.DataFrame) -> pl.DataFrame:

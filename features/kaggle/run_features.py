@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Kaggle kernel: 从 data-merged / vision-base 拉月度文件，算订单簿特征并合并。
 
-产出（Release，按月可续传）：
-  ob-features     : ob_features_{exchange}_{YYYY-MM}.parquet   (L1 截面，逐月中间态)
-  merged-features : merged_BTCUSDT_{YYYY-MM}.parquet            (逐月中间态)
-                    BTCUSDT.parquet                             (最终交付：全窗口单文件)
+产出（Release，按月可续传；tag 后缀随分箱口径，默认 vol8）：
+  ob-features-vol8     : ob_features_{exchange}_{YYYY-MM}.parquet  (L1 截面，逐月中间态)
+  merged-features-vol8 : merged_BTCUSDT_{YYYY-MM}.parquet          (逐月中间态)
+                         BTCUSDT.parquet                           (最终交付：全窗口单文件)
 
 流程：
   1. 拉全部 vision-base（BTCUSDT，54MB），小。
@@ -12,7 +12,7 @@
      -> 删 band+mid（控磁盘）。月与月之间 L1 都留在本地（rolling 要跨月）。
   3. 全月算完：build_dataset.py（全序列 reindex+滚动+合并 vision+校验门禁）
      -> merged_BTCUSDT_{YYYY-MM}.parquet。
-  4. 上传 ob-features / merged-features；已存在的资产跳过（真正增量）。
+  4. 上传 ob-features-vol8 / merged-features-vol8；已存在的资产跳过（真正增量）。
 
 安全：本文件**不含密钥**，GH_TOKEN 走 env / Kaggle Secrets（见 _secret）。
 断点续传：上传成功的月份资产下次运行直接跳过；band 下载用 HTTP Range 续传。
@@ -38,10 +38,16 @@ GH_API = "https://api.github.com"
 GH_UPLOAD = "https://uploads.github.com"
 DL_BASE = f"https://github.com/{GH_REPO}/releases/download"
 
-START, END = "2025-07-01", "2026-10-20"
+START = os.environ.get("START", "2025-07-01")
+END = os.environ.get("END", "2026-10-20")
 # 标的可用环境变量覆盖（VISION_SYMBOL）；默认 BTCUSDT，保持既有行为不变。
 SYMBOL = os.environ.get("VISION_SYMBOL", "BTCUSDT")
 EXCHANGES = ("binance_futures", "binance_spot")
+# 分箱口径。vol8 与 bps 的 L1/merged 不可混用，所以 release tag 跟着口径走：
+# 换口径 = 新 tag = 不复用旧 L1，也不会把新文件 skip 掉。
+OB_BIN_MODE = os.environ.get("OB_BIN_MODE", "vol8")
+L1_TAG = f"ob-features-{OB_BIN_MODE}"
+MERGED_TAG = f"merged-features-{OB_BIN_MODE}"
 
 WORK = Path("/kaggle/working")
 ROOT = WORK / "bn_hisdata"
@@ -221,7 +227,7 @@ def main():
             if out.exists():
                 continue
             # 优先复用 Release 上已算好的 L1（重跑时省掉重新下载 band + 聚合）
-            if download(f"{DL_BASE}/ob-features/{out.name}", out, optional=True) is not None:
+            if download(f"{DL_BASE}/{L1_TAG}/{out.name}", out, optional=True) is not None:
                 print(f"[{m}] reuse cached L1 {ex}", flush=True)
                 continue
             print(f"[{m}] download {ex} band ...", flush=True)
@@ -229,12 +235,12 @@ def main():
             download(f"{DL_BASE}/data-merged/{mid.name}", mid)
             print(f"[{m}] compute L1 {ex} ...", flush=True)
             run("features/ob_features.py", "--band", str(band), "--mid", str(mid),
-                "--out", str(out), "--force")
+                "--out", str(out), "--bin-mode", OB_BIN_MODE, "--force")
             band.unlink(missing_ok=True)
             mid.unlink(missing_ok=True)
         # 上传本月的两份 L1（增量），本地保留供 rolling
         for ex in EXCHANGES:
-            print(f"[{m}] upload L1 {ex}", upload("ob-features",
+            print(f"[{m}] upload L1 {ex}", upload(L1_TAG,
                                                   L1 / f"ob_features_{ex}_{m}.parquet"),
                   flush=True)
 
@@ -247,7 +253,7 @@ def main():
 
     # 4) 上传逐月 merged（增量中间态，供单月消费/断点续传）
     for fp in sorted(MERGED.glob("merged_*.parquet")):
-        print(f"upload {fp.name}", upload("merged-features", fp), flush=True)
+        print(f"upload {fp.name}", upload(MERGED_TAG, fp), flush=True)
 
     # 5) 合并成单个 {SYMBOL}.parquet（最终交付）并覆盖上传
     final = WORK / f"{SYMBOL}.parquet"
@@ -264,7 +270,7 @@ def main():
     df.write_parquet(final, compression="zstd")
     print(f"final: {final.name} {df.height:,} rows x {df.width} cols "
           f"{final.stat().st_size / 1e6:.1f} MB", flush=True)
-    print(f"upload {final.name}", upload_replace("merged-features", final), flush=True)
+    print(f"upload {final.name}", upload_replace(MERGED_TAG, final), flush=True)
     # 清理中间目录，让 Kaggle output 只保留最终产物（merged + BTCUSDT.parquet）
     import shutil
     for d in (L1, OB, VIS):
