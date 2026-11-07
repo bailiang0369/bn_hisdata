@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import re
 import time
 from pathlib import Path
 
@@ -48,7 +47,6 @@ import polars as pl
 from ob_rolling import build_l2, _reindex, _sanitize
 
 T = time.time()
-MONTH_RE = re.compile(r"(\d{4}-\d{2})")
 
 # L1 深度分箱：与 ob_features.py 的默认 vol8 口径对应，边界是 σ 倍数
 # [0,1)[1,2)[2,4)[4,8)[8,∞) -> v0..v4。单位**不是 bps**：插值前要用 ob_f_sigma_bps
@@ -62,13 +60,6 @@ AMP_MEAN_WIN = "30m"  # 对 5 分钟振幅做滚动均值的窗口
 
 def log(msg: str) -> None:
     print(f"[{time.time() - T:7.1f}s] {msg}", flush=True)
-
-
-def _month(f: str) -> str:
-    m = MONTH_RE.search(Path(f).name)
-    if not m:
-        raise SystemExit(f"文件名里没有 YYYY-MM: {f}")
-    return m.group(1)
 
 
 def _prefix(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
@@ -266,10 +257,13 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for vf in vision_files:
-        m = _month(vf)
-        vc = pl.read_parquet(vf).select("close_time")
-        v = v_all.join(vc, on="close_time", how="semi").sort("close_time")
+    # vision 按自然年发布（`{SYMBOL}_1m_klines_{YYYY}.parquet`，一个文件一年），
+    # 而 merged 仍按月切分：月份从 close_time 推，不能从文件名解析（名字里只有年份）。
+    v_all = v_all.with_columns(
+        pl.from_epoch(pl.col("close_time"), time_unit="ms")
+        .dt.strftime("%Y-%m").alias("_month"))
+    for m in sorted(v_all["_month"].unique().to_list()):
+        v = v_all.filter(pl.col("_month") == m).drop("_month").sort("close_time")
         out = v.join(fut, on="close_time", how="left")
         out = _amp_features(out)
         out = _atkdef_features(out)
