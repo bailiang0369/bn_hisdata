@@ -62,6 +62,8 @@ jobs:
             echo "DATA_STATUS.md 无变化，跳过提交"
             exit 0
           fi
-          git commit -m "data: K 线更新至 $(date -u +%F)（自动）"
+          # 用数据实际覆盖到的日期，而不是运行日（两者差一天，容易看成"数据已到昨天"）
+          TARGET=$(python -c "import io,re;t=io.open('DATA_STATUS.md',encoding='utf-8').read();m=re.search(r'目标日期：(\S+)',t);print(m.group(1) if m else '')")
+          git commit -m "data: K 线更新至 ${TARGET:-$(date -u +%F)}（自动）"
           git pull --rebase origin "$GITHUB_REF_NAME"
           git push origin "HEAD:$GITHUB_REF_NAME"
