@@ -50,9 +50,12 @@ def _ensure_repo() -> Path:
 
 
 def main() -> int:
-    os.environ["GH_TOKEN"] = _secret("GH_TOKEN")
+    mode = os.environ.get("MODE", "backfill")
+    if mode != "probe":                     # probe 不碰 GitHub，不需要 token
+        os.environ["GH_TOKEN"] = _secret("GH_TOKEN")
     repo = _ensure_repo()
     os.chdir(repo)
+    sys.path.insert(0, str(repo))
     print(f"repo: {repo}", flush=True)
 
     try:
@@ -62,7 +65,18 @@ def main() -> int:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                         "polars", "requests"], check=True)
 
-    mode = os.environ.get("MODE", "backfill")
+    if mode == "probe":
+        import time
+        from datetime import date
+        import binance_vision.pipeline_daily as p
+        t = time.time()
+        m = p.fetch_month("BTCUSDT", 2020, 1)
+        print(f"月度 2020-01: {m.height} 行, {time.time() - t:.1f}s", flush=True)
+        t = time.time()
+        d = p.fetch_day("BTCUSDT", date(2026, 11, 5))
+        print(f"日度 2026-11-05: {d.height} 行, {time.time() - t:.1f}s", flush=True)
+        return 0
+
     cmd = [sys.executable, "binance_vision/pipeline_daily.py", mode,
            "--symbols", os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT"),
            "--jobs", os.environ.get("JOBS", "16")]
