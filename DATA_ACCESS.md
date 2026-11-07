@@ -17,7 +17,7 @@
 
 | Release tag | 资产 | 命名 | 体量 | 用途 |
 |---|---|---|---|---|
-| `vision-base` | 每标的每年 1 个 parquet | `{SYMBOL}_base_features_{YYYY}.parquet` | 每年约 20–30 MB | **主用**。合约+现货 1m K 线（15 列，含现货 OHLC），每日自动更新 |
+| `vision-base` | 每标的每年 1 个 parquet | `{SYMBOL}_1m_klines_{YYYY}.parquet` | 每年约 20–30 MB | **主用**。原始 1m K 线（um + spot，15 列），**不是特征**，每日自动更新 |
 | `data-merged` | 64 个 parquet | `{exchange}_minute_band_{YYYY-MM}.parquet`<br>`{exchange}_minute_band_mid_{YYYY-MM}.parquet` | 10.5 GB | **主用**。L2 订单簿的分钟级窄带快照 |
 | `data-{YYYY-MM}` | 每日 zip | `{YYYY-MM-DD}.zip` | 16 个月，~10 GB | 重建的**中间态**（每日 band+mid + 原始小时文件），正常消费**不需要** |
 | `ob-features` | 32 个 parquet | `ob_features_{exchange}_{YYYY-MM}.parquet` | 约 100 MB | 订单簿 L1 截面特征（中间态，供 merged 重建） |
@@ -32,7 +32,7 @@
 资产直链（公开仓库，**无需 token**）：
 
 ```
-https://github.com/bailiang0369/bn_hisdata/releases/download/vision-base/BTCUSDT_base_features_2026.parquet
+https://github.com/bailiang0369/bn_hisdata/releases/download/vision-base/BTCUSDT_1m_klines_2026.parquet
 https://github.com/bailiang0369/bn_hisdata/releases/download/data-merged/binance_futures_minute_band_mid_2025-07.parquet
 ```
 
@@ -48,7 +48,7 @@ Release 都标了 **prerelease**，但内容可用；`gh release download` 需�
 ```bash
 # 只要 vision 的 BTCUSDT，全部年份（约 2 个文件、几十 MB）
 gh release download vision-base --repo bailiang0369/bn_hisdata \
-    --pattern 'BTCUSDT_base_features_*.parquet' --dir ./data/vision
+    --pattern 'BTCUSDT_1m_klines_*.parquet' --dir ./data/vision
 
 # 只要订单簿 mid（每分钟一行，做时间对齐最常用）
 gh release download data-merged --repo bailiang0369/bn_hisdata \
@@ -263,7 +263,7 @@ feat = vision.join(ob_mid, left_on=(pl.col("close_time") - 60_000), right_on="bu
 import polars as pl
 from pathlib import Path
 
-VISION = Path("./data/vision")   # BTCUSDT_base_features_*.parquet
+VISION = Path("./data/vision")   # BTCUSDT_1m_klines_*.parquet
 OB = Path("./data/ob")           # binance_futures_minute_band_mid_*.parquet
 
 
@@ -276,7 +276,7 @@ def load(symbol: str, years: list[int], months: list[str],
     """
     # 1) K 线侧：统一坐标 close_time -> 分钟起点 bucket
     k = (
-        pl.scan_parquet([VISION / f"{symbol}_base_features_{y}.parquet" for y in years])
+        pl.scan_parquet([VISION / f"{symbol}_1m_klines_{y}.parquet" for y in years])
         .select(
             (pl.col("close_time") - 60_000).alias("bucket"),
             pl.exclude("close_time"),

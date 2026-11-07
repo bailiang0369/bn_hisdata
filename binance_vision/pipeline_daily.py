@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""按年切分的 1m K 线基础表管线：日度增量 → 年度 parquet → GitHub Release。
+"""按年切分的 1m K 线数据管线：日度增量 → 年度 parquet → GitHub Release。
+
+数据是**原始 K 线**（um + spot 各 7 列，共 15 列），不是衍生特征 —— 文件名不说
+features，免得下游误以为里面已经算好了指标。
 
 为什么按年（2026-11 定稿）
 --------------------------
@@ -9,12 +12,11 @@ IO 随历史线性增长，跑几年后单次更新就是几百 MB 白跑一趟�
 
 * 增量只碰**当年**那一个文件（几十 MB）；历史年份写完即冻结，不再读写；
 * 消费端可以只取需要的年份，也可以一条命令并发拉全部年份再拼接（列一致）；
-* 命名 `{SYMBOL}_base_features_{YYYY}.parquet`，沿用旧月度资产的 glob 习惯，
-  只是把 `{YYYY-MM}` 换成 `{YYYY}`。
+* 命名 `{SYMBOL}_1m_klines_{YYYY}.parquet`，一年一个文件。
 
 release `vision-base` 里的资产（每标的每年一个）
-    BTCUSDT_base_features_2025.parquet   # 已冻结
-    BTCUSDT_base_features_2026.parquet   # 当年，持续增长，跨年后冻结
+    BTCUSDT_1m_klines_2025.parquet   # 已冻结
+    BTCUSDT_1m_klines_2026.parquet   # 当年，持续增长，跨年后冻结
 
 幂等
 ----
@@ -26,8 +28,10 @@ release `vision-base` 里的资产（每标的每年一个）
 ----
     python binance_vision/pipeline_daily.py update                     # 补到 UTC 昨天
     python binance_vision/pipeline_daily.py update --date 2026-11-06   # 补到指定日
-    python binance_vision/pipeline_daily.py backfill --start 2025-07-01 --end 2026-11-06
-    python binance_vision/pipeline_daily.py prune-legacy                # 列旧月度文件；加 --yes 才删
+    python binance_vision/pipeline_daily.py backfill --start 2020-01-01
+    python binance_vision/pipeline_daily.py audit                      # 逐年缺口明细
+    python binance_vision/pipeline_daily.py rename-assets              # 旧命名迁移（一次性）
+    python binance_vision/pipeline_daily.py prune-legacy --yes         # 删旧月度资产
 
 凭据：环境变量 GH_TOKEN（GitHub Actions 里传 secrets.GITHUB_TOKEN）。
 """
@@ -52,7 +56,15 @@ GH_API = "https://api.github.com"
 GH_UPLOAD = "https://uploads.github.com"
 
 RELEASE_TAG = "vision-base"
-RELEASE_TITLE = "Binance Vision K-line base features（按年切分）"
+RELEASE_TITLE = "Binance Vision 1m K线数据（按年，2020 起）"
+RELEASE_BODY = (
+    "**原始 1m K 线数据，不是衍生特征。**\n\n"
+    "- 每标的每年一个 parquet：`{SYMBOL}_1m_klines_{YYYY}.parquet`\n"
+    "- 15 列：`close_time` + 合约（um）OHLC / 主动买量 / 主动卖量 / 笔数 + 现货 OHLC / 主动买量 / 主动卖量 / 笔数\n"
+    "- 时间：UTC，`close_time` 为 Int64 毫秒（bar 结束时刻 +1ms = 下一分钟起点）\n"
+    "- 覆盖 `2020-01-01` 至今，每天 UTC 06:17 自动更新；当年那份持续增长，跨年后冻结\n"
+    "- 由 `binance_vision/pipeline_daily.py` 维护，最新日期见仓库 `DATA_STATUS.md`"
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 STATUS_FILE = ROOT / "DATA_STATUS.md"
@@ -72,7 +84,9 @@ MIN_ROWS_PER_DAY = 600
 EXPECTED_ROWS_PER_DAY = 1440   # 体检口径：一天完整应有多少根
 DEFAULT_START = date(2020, 1, 1)   # 数据源最早可用日（um 2019-12-31 起、spot 更早）；首次运行自动从这里回填
 
-YEARLY_RE = re.compile(r"^(?P<sym>[A-Z0-9]+USDT)_base_features_(?P<year>(?:19|20)\d{2})\.parquet$")
+YEARLY_RE = re.compile(r"^(?P<sym>[A-Z0-9]+USDT)_1m_klines_(?P<year>(?:19|20)\d{2})\.parquet$")
+# 旧命名，仅用于一次性迁移/清理：{SYMBOL}_base_features_{YYYY} 与 {YYYY-MM}
+LEGACY_YEARLY_RE = re.compile(r"^(?P<sym>[A-Z0-9]+USDT)_base_features_(?P<year>(?:19|20)\d{2})\.parquet$")
 MONTHLY_RE = re.compile(r"^(?P<sym>[A-Z0-9]+USDT)_base_features_(?P<ym>(?:19|20)\d{2}-\d{2})\.parquet$")
 
 
@@ -115,7 +129,7 @@ def _daterange(lo: date, hi: date) -> list[date]:
 
 
 def _yearly_name(sym: str, year: int) -> str:
-    return f"{sym}_base_features_{year}.parquet"
+    return f"{sym}_1m_klines_{year}.parquet"
 
 
 def _symbols(args) -> list[str]:
@@ -148,13 +162,17 @@ class GH:
                                 timeout=900, **kw)
 
     def ensure_release(self, tag: str, name: str) -> int:
+        """取或建 release，并把标题/描述同步成当前口径（旧标题不会自己更新）。"""
         r = self.call("GET", f"{GH_API}/repos/{self.repo}/releases/tags/{tag}")
         if r.status_code == 200:
-            return r.json()["id"]
+            rid = r.json()["id"]
+            if r.json().get("name") != name or r.json().get("body") != RELEASE_BODY:
+                self.call("PATCH", f"{GH_API}/repos/{self.repo}/releases/{rid}",
+                          json={"name": name, "body": RELEASE_BODY})
+                log(f"  release 标题/描述已同步：{name}")
+            return rid
         r = self.call("POST", f"{GH_API}/repos/{self.repo}/releases",
-                      json={"tag_name": tag, "name": name,
-                            "body": "由 `binance_vision/pipeline_daily.py` 每日自动维护；"
-                                    "每个标的每年一个 parquet。",
+                      json={"tag_name": tag, "name": name, "body": RELEASE_BODY,
                             "prerelease": False})
         if r.status_code not in (200, 201):
             raise SystemExit(f"cannot create release {tag}: {r.status_code} {r.text[:300]}")
@@ -448,11 +466,11 @@ def _years_present(assets: dict[str, int], sym: str) -> dict[int, int]:
 
 
 def _warn_legacy(assets: dict[str, int]) -> None:
-    legacy = sorted(n for n in assets if MONTHLY_RE.match(n))
+    legacy = sorted(n for n in assets if MONTHLY_RE.match(n) or LEGACY_YEARLY_RE.match(n))
     if legacy:
-        log(f"NOTE: release 里仍有 {len(legacy)} 个旧月度文件（与年度文件数据重叠，"
-            f"glob `*_base_features_*` 会拿到双份）。确认年度文件齐全后跑 "
-            f"`pipeline_daily.py prune-legacy --yes` 清掉。")
+        log(f"NOTE: release 里还有 {len(legacy)} 个旧命名文件（与年度文件数据重叠，"
+            f"glob 全量会拿到双份）。年度文件齐全后跑 `rename-assets` / "
+            f"`prune-legacy --yes` 清理。")
 
 
 # ---------------------------------------------------------------- 命令
@@ -563,6 +581,38 @@ def cmd_backfill(args) -> int:
     return 0
 
 
+def cmd_rename(args) -> int:
+    """把旧命名的年度资产改成 `{SYMBOL}_1m_klines_{YYYY}.parquet`（一次性）。
+
+    GitHub 不支持改资产名，只能 下载 → 新名上传 → 删旧。先传后删，不留空窗。
+    """
+    gh = GH(args.repo)
+    rid = gh.ensure_release(RELEASE_TAG, RELEASE_TITLE)
+    assets = gh.assets(rid)
+
+    todo = []
+    for name in sorted(assets):
+        m = LEGACY_YEARLY_RE.match(name)
+        if not m:
+            continue
+        new = _yearly_name(m.group("sym"), int(m.group("year")))
+        if new in assets:
+            log(f"  跳过 {name}（{new} 已存在）")
+            continue
+        todo.append((name, new))
+
+    if not todo:
+        log("没有需要改名得资产")
+        return 0
+    for old, new in todo:
+        log(f"  {old} -> {new}")
+        data = gh.download(assets[old])
+        gh.upload(rid, new, data)
+        gh.delete(assets[old], old)
+    log(f"改名完成：{len(todo)} 个")
+    return 0
+
+
 def cmd_audit(args) -> int:
     """体检：每年行数/覆盖范围/缺口明细。只读，不改 release。"""
     gh = GH(args.repo)
@@ -644,7 +694,7 @@ def status_md(target: date, info: dict[str, dict]) -> str:
         lines.append(f"- 最新覆盖日期：{_date_of_ms(v['latest'])}"
                      f"（最后一行 close_time = {_fmt_ms(v['latest'])} UTC）")
         for year, (rows, last) in sorted(v["touched"].items()):
-            lines.append(f"- 本次写入 `{sym}_base_features_{year}.parquet`："
+            lines.append(f"- 本次写入 `{_yearly_name(sym, year)}`："
                          f"{rows:,} 行，覆盖到 {_date_of_ms(last)}")
         lines.append("")
 
@@ -653,15 +703,15 @@ def status_md(target: date, info: dict[str, dict]) -> str:
         "按年一个 parquet，列结构一致、时间不重叠，直接 scan 拼接：", "",
         "```bash",
         "python tools/fetch_release.py --tag vision-base \\",
-        "    --pattern 'BTCUSDT_base_features_*.parquet' --dest ./data/vision",
+        "    --pattern 'BTCUSDT_1m_klines_*.parquet' --dest ./data/vision",
         "```", "",
         "```python",
         "import polars as pl",
         "from pathlib import Path",
-        "lf = pl.scan_parquet(sorted(Path('./data/vision').glob('BTCUSDT_base_features_*.parquet')))",
+        "lf = pl.scan_parquet(sorted(Path('./data/vision').glob('BTCUSDT_1m_klines_*.parquet')))",
         "```", "",
-        "当年那份文件仍在增长（跨年后冻结），不要假定它的大小；"
-        "完整 schema 与时间口径见 `DATA_ACCESS.md`。", "",
+        "这些是**原始 K 线**（15 列），不含任何衍生特征；当年那份文件仍在增长"
+        "（跨年后冻结），不要假定它的大小。完整 schema 与时间口径见 `DATA_ACCESS.md`。", "",
     ]
     return "\n".join(lines)
 
@@ -670,7 +720,8 @@ def status_md(target: date, info: dict[str, dict]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("update", "backfill", "audit", "prune-legacy"))
+    ap.add_argument("cmd", choices=("update", "backfill", "audit",
+                                    "rename-assets", "prune-legacy"))
     ap.add_argument("--repo", default="bailiang0369/bn_hisdata")
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT")
     ap.add_argument("--date", default=None, help="update: 补到哪一天（YYYY-MM-DD）")
@@ -686,6 +737,8 @@ def main() -> int:
         return cmd_backfill(args)
     if args.cmd == "audit":
         return cmd_audit(args)
+    if args.cmd == "rename-assets":
+        return cmd_rename(args)
     return cmd_prune_legacy(args)
 
 

@@ -17,7 +17,7 @@ parquet 已经发布在本仓库的 GitHub Release，1 分钟粒度（UTC，Int6
 
 | Release | 内容 | 资产命名 | 体量 |
 |---|---|---|---|
-| `vision-base` | 合约+现货 1m K 线（含现货 OHLC，不含 metrics / basis；BTCUSDT / ETHUSDT，15 列），**`2020-01-01` 至今**，每天自动更新 | `{SYMBOL}_base_features_{YYYY}.parquet`（**每标的每年一个**，当年那份持续增长） | ~20–30 MB / 年 |
+| `vision-base` | **原始 1m K 线**（um + spot 各 7 列，15 列；不是衍生特征），BTCUSDT / ETHUSDT，**`2020-01-01` 至今**，每天自动更新 | `{SYMBOL}_1m_klines_{YYYY}.parquet`（**每标的每年一个**，当年那份持续增长） | ~20–30 MB / 年 |
 | `data-merged` | L2 订单簿分钟快照（futures + spot） | `{exchange}_minute_band[_mid]_{YYYY-MM}.parquet` | 10.5 GB / 64 个 |
 | `data-{YYYY-MM}` | 重建中间态（每日 zip，**消费端用不到**） | `{YYYY-MM-DD}.zip` | ~10 GB |
 
