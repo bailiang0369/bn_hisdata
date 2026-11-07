@@ -201,10 +201,18 @@ def validate(df: pl.DataFrame, n_vision: int) -> dict:
     """返回校验报告；不通过抛 SystemExit。"""
     rep: dict = {"vision_rows": n_vision, "merged_rows": df.height}
     assert df["close_time"].is_sorted(), "close_time 未排序"
-    rep["max_gap_ms"] = int(df["close_time"].diff().drop_nulls().max())
+    gaps = df["close_time"].diff().drop_nulls()
+    rep["max_gap_ms"] = int(gaps.max()) if gaps.len() else 60_000
     rep["dup_close_time"] = int(df.height - df["close_time"].n_unique())
-    assert rep["max_gap_ms"] == 60_000, f"分钟缺口: {rep['max_gap_ms']}"
+    # 门禁只卡「非整分钟」的缺口：那是拼接/对齐错位的硬证据。
+    # 整分钟缺口说明源端确实缺了这段（vision-base 有整天缺失的先例，
+    # 如 2026-10-28），属上游数据状态，报告出来但不拦截。
+    assert rep["max_gap_ms"] % 60_000 == 0, \
+        f"缺口不是整分钟，疑似对齐错位: {rep['max_gap_ms']}ms"
     assert rep["dup_close_time"] == 0, "close_time 重复"
+    missing_min = int(((gaps - 60_000) // 60_000).sum())
+    if missing_min:
+        rep["missing_minutes"] = missing_min
 
     if "ob_f_mid" in df.columns:
         # 覆盖率只报告、不设门禁：源端断流、单边有量、上游某天 orderbook 缺失都会留下
@@ -259,10 +267,18 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     # vision 按自然年发布（`{SYMBOL}_1m_klines_{YYYY}.parquet`，一个文件一年），
     # 而 merged 仍按月切分：月份从 close_time 推，不能从文件名解析（名字里只有年份）。
-    v_all = v_all.with_columns(
-        pl.from_epoch(pl.col("close_time"), time_unit="ms")
-        .dt.strftime("%Y-%m").alias("_month"))
-    for m in sorted(v_all["_month"].unique().to_list()):
+    # 且只产出「有 L1」的月份——年文件里可能含还没算 L1 的月份，为它们产 merged
+    # 会得到整月 ob_* 全 null 的假数据。
+    def _ym(col: str = "close_time") -> pl.Expr:
+        return pl.from_epoch(pl.col(col), time_unit="ms").dt.strftime("%Y-%m")
+
+    ob_months = set(fut.select(_ym().alias("m"))["m"].unique().to_list())
+    v_all = v_all.with_columns(_ym().alias("_month"))
+    months = sorted(set(v_all["_month"].unique().to_list()) & ob_months)
+    if not months:
+        raise SystemExit("vision 与 L1 没有重叠月份，检查 --vision / --fut 传的文件")
+    log(f"months to build: {len(months)} ({months[0]} .. {months[-1]})")
+    for m in months:
         v = v_all.filter(pl.col("_month") == m).drop("_month").sort("close_time")
         out = v.join(fut, on="close_time", how="left")
         out = _amp_features(out)
