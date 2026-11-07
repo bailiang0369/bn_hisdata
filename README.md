@@ -13,21 +13,28 @@ BTCUSDT 历史数据工程。按数据源与处理逻辑分模块组织：
 
 ## 已发布的数据（下游项目直接取，不用跑管线）
 
-按月切好的 parquet 已经发布在本仓库的 GitHub Release，覆盖 `2025-07-01 ~ 2026-10-20`
-的 1 分钟粒度（UTC，Int64 毫秒时间戳）：
+parquet 已经发布在本仓库的 GitHub Release，1 分钟粒度（UTC，Int64 毫秒时间戳）：
 
 | Release | 内容 | 资产命名 | 体量 |
 |---|---|---|---|
-| `vision-base` | K线 + 基差 + 合约 metrics 宽表（BTCUSDT / ETHUSDT，19 列） | `{SYMBOL}_base_features_{YYYY-MM}.parquet` | 54 MB / 32 个 |
+| `vision-base` | 合约+现货 1m K 线（含现货 OHLC，不含 metrics / basis；BTCUSDT / ETHUSDT，15 列），**`2020-01-01` 至今**，每天自动更新 | `{SYMBOL}_base_features_{YYYY}.parquet`（**每标的每年一个**，当年那份持续增长） | ~20–30 MB / 年 |
 | `data-merged` | L2 订单簿分钟快照（futures + spot） | `{exchange}_minute_band[_mid]_{YYYY-MM}.parquet` | 10.5 GB / 64 个 |
 | `data-{YYYY-MM}` | 重建中间态（每日 zip，**消费端用不到**） | `{YYYY-MM-DD}.zip` | ~10 GB |
 
-一行取数：
+一行取数（全部年份 = 2 个文件、一次并发拉完）：
 
 ```bash
 python tools/fetch_release.py --tag vision-base --pattern 'BTCUSDT_*' --dest ./data/vision
 python tools/fetch_release.py --tag data-merged --pattern '*minute_band_mid_*' --dest ./data/ob
 ```
+
+为什么按年切而不发一个全量文件：全量单文件意味着每天更新都要下载整个历史、再重传
+整个历史，IO 随历史线性增长；按年后增量只碰当年那一个文件，历史年份写完即冻结。
+
+已知缺口（源站缺失，不是管线问题）：`2026-10-28` 合约侧日度文件在
+`data.binance.vision` 上不存在（现货有），15 列需要两侧都有，故整天缺失；另有
+少数交易所停摆日只有 1085–1439 根（如 `2020-02-19` 1085 根，两标的完全一致）。
+逐日明细见 [`DATA_STATUS.md`](DATA_STATUS.md)。
 
 **schema、时间对齐口径、整合示例、踩坑清单见[`DATA_ACCESS.md`](DATA_ACCESS.md)**。
 其中最要紧的一条：K 线侧 `close_time` 与订单簿侧 `bucket` 差**一分钟**
@@ -45,8 +52,8 @@ tmux new -s data
 CHD_API_KEY=xxx bash run_all_cloud.sh 2>&1 | tee run_all.log
 ```
 
-步骤：① vision klines+metrics+基础宽表 → ② vision aggTrades+master 宽表 →
-③ orderbook R2 下载+分钟快照（按天，原始即删）→ ④ orderbook 月度聚合。
+步骤：① vision klines → K 线基础表（15 列） → ② orderbook R2 下载+分钟快照
+（按天，原始即删）→ ③ orderbook 月度聚合。（metrics / aggTrades 2026-11 起不做）
 可用 `SKIP_VISION=1` / `SKIP_ORDERBOOK=1` 只跑一半；`START/END/JOBS/LEAN`
 环境变量可覆盖（默认窗口 `2025-06-01 ~ 昨天`）。
 
@@ -90,6 +97,23 @@ python orderbook/merge_monthly.py --dest-root orderbook/data
 
 ## binance_vision 模块
 
+### 每日增量（Release 里的 `vision-base` 就是它产出的）
+
+```bash
+python binance_vision/pipeline_daily.py update                       # 补到 UTC 昨天，只改当年文件
+python binance_vision/pipeline_daily.py backfill --start 2020-01-01  # 首次回填 / 补历史缺口
+python binance_vision/pipeline_daily.py audit                        # 体检：逐年缺口明细
+python binance_vision/pipeline_daily.py prune-legacy --yes           # 清掉旧月度资产（先不带 --yes 看清单）
+```
+
+`.github/workflows/vision-daily.yml` 每天 UTC 06:17 自动跑一次并提交
+`DATA_STATUS.md`。按"已覆盖到哪一天"推进，漏跑几天、数据源延迟发布都会在下次运行
+自动补齐；目标日 404 只跳过，不算失败。
+
+**批量回填走 Kaggle**（`binance_vision/kaggle/pipeline_run.py`）：2020 至今要下
+84 个月度 zip，本地跨境网络单请求几十秒到几分钟，机房 1 秒就能拿完一个月。
+回填用月度文件（1 次请求换 ~30 次日度请求），7 年两标的共 168 个请求、约 2 分钟。
+
 ```bash
 # 下载 + 清洗，默认输出 parquet（--format csv 可输出 CSV 便于肉眼检查）
 # 整月 klines：每个 market×symbol 一个 zip。
@@ -116,17 +140,14 @@ python binance_vision/download_binance_vision.py --market both --symbol all \
 > um = 7 列有表头、毫秒时间戳；spot = 8 列无表头、微秒时间戳。
 
 ```bash
-# 第一阶段：基础宽表（um+spot klines + basis + metrics，全流式 lazy 管道）。
-# aggTrades 和 orderbook 一样：下载量大、只贡献衍生特征不进原表，放第二阶段。
-# --no-agg 显式跳过 aggTrades，输出 {symbol}_base_features_1m.parquet
-python binance_vision/build_master_features.py --symbol BTCUSDT --no-agg
-
-# 第二阶段：补下 aggTrades（um+spot 两个市场都下）后重建完整 master 表
-# （此时缺 um aggTrades 会硬失败；缺 spot 只警告，spot_agg_* 与 rv_dominance 缺席）
-python binance_vision/download_binance_vision.py --market both --symbol BTCUSDT \
-    --category aggTrades --interval 1m --granularity daily \
-    --start-date 2025-06-01 --end-date 2026-10-01 -j 8
+# 默认即基础表：um+spot 1m klines，含现货 OHLC，15 列，全流式 lazy 管道。
+# aggTrades 默认跳过（2026-11 实测后判定不做，见 DATA_ACCESS §3.1）。
+# 输出 {symbol}_base_features_1m.parquet
 python binance_vision/build_master_features.py --symbol BTCUSDT
+
+# 可选：只有确实需要那 20 列逐笔微观特征时才加 --with-agg，
+# 此时缺 um aggTrades 会硬失败（缺 spot 只警告）。
+python binance_vision/build_master_features.py --symbol BTCUSDT --with-agg
 
 # 单元测试（从仓库根运行；根目录 conftest.py 负责把仓库根加入 sys.path）
 python -m pytest binance_vision -q
