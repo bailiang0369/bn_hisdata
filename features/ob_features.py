@@ -52,14 +52,24 @@ from pathlib import Path
 
 import polars as pl
 
-# 分箱上界（bps）：[0,2) [2,5) [5,10) [10,20) [20,30]
-BIN_EDGES = (2.0, 5.0, 10.0, 20.0, 30.0)
-BIN_NAMES = ("b0", "b1", "b2", "b3", "b4")
-BIN_IDX = {str(i): n for i, n in enumerate(BIN_NAMES)}
-NEAR = ("b0", "b1")          # 0-5 bps
-UP_TO_10 = ("b0", "b1", "b2")  # 0-10 bps
-FAR = ("b3", "b4")           # 10-30 bps
+# 两种分箱口径。都切 5 个桶，列数一致，便于同维度 A/B。
+#   bps：固定距离 [0,2) [2,5) [5,10) [10,20) [20,30] bps（历史口径）
+#   vol：距离 / 当期波动尺度 sigma（无量纲），阈值 [0,0.5) [0.5,1) [1,2) [2,4) [4,inf)
+#        —— 周末低波动时 2bps 就算"远"，美股开盘前后 20bps 可能只是"近"，固定 bps 表达不了。
+BIN_MODES = {
+    "bps": ((2.0, 5.0, 10.0, 20.0), ("b0", "b1", "b2", "b3", "b4")),
+    "vol": ((0.5, 1.0, 2.0, 4.0), ("v0", "v1", "v2", "v3", "v4")),
+}
+BIN_EDGES, BIN_NAMES = BIN_MODES["bps"]      # 默认口径，保持向后兼容
+SIGMA_WINDOW = 30        # 波动尺度：过去 N 个 1 分钟对数收益的标准差
+SIGMA_FLOOR = 0.5        # sigma 下限（bps），防除零与极端放大
 T = time.time()
+
+
+def _groups(mode: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """按口径返回 (近层, 至x, 远层) 的桶名组合。"""
+    names = BIN_MODES[mode][1]
+    return (names[:2], names[:3], names[3:])
 
 
 def log(msg: str) -> None:
@@ -75,39 +85,72 @@ def _sanitize(df: pl.DataFrame) -> pl.DataFrame:
     ])
 
 
-def _bin_expr(d: pl.Expr) -> pl.Expr:
-    """距离(bps) -> 分箱索引 0..4；band 边界是 30bps，越界一律归到最后一箱。"""
-    e = pl.lit(len(BIN_EDGES) - 1, dtype=pl.Int8)
-    for i, edge in reversed(list(enumerate(BIN_EDGES))):
-        e = pl.when(d < edge).then(pl.lit(i, dtype=pl.Int8)).otherwise(e)
+def _bin_expr(d: pl.Expr, edges: tuple[float, ...]) -> pl.Expr:
+    """距离 -> 分箱索引 0..len(edges)；超出最后一个上界归到最后一箱。"""
+    e = pl.lit(len(edges), dtype=pl.Int8)
+    for i in reversed(range(len(edges))):
+        e = pl.when(d < edges[i]).then(pl.lit(i, dtype=pl.Int8)).otherwise(e)
     return e
 
 
-def _prepare(band: pl.LazyFrame) -> pl.LazyFrame:
-    """去重 + 逐行派生 sc / d(bps) / bin / key。"""
-    return (
+def _sigma_from_mid(mid: pl.DataFrame, window: int = SIGMA_WINDOW) -> pl.DataFrame:
+    """每分钟的波动尺度 sigma（bps）= 过去 window 个 1 分钟对数收益的标准差。
+
+    shift(1) 是防前视的硬前提：t 时刻的分箱边界只能用 t-1 及之前实现的收益。
+    开头 window 分钟不足、以及 mid 断档处的 null，用当月中位数填（不用未来值）。
+    """
+    s = (
+        mid.sort("bucket")
+        .select("bucket", "mid")
+        .with_columns((pl.col("mid") / pl.col("mid").shift(1)).log().mul(1e4).alias("r"))
+        .with_columns(pl.col("r").rolling_std(window).shift(1).alias("sigma"))
+        .select("bucket", "sigma")
+    )
+    med = s["sigma"].median()
+    if med is None or not med > 0:
+        raise SystemExit("sigma 全为空，无法用波动率分箱（mid 序列可能断档过多）")
+    log(f"sigma: median={med:.2f}bps, null={s['sigma'].null_count():,}")
+    return s.with_columns(pl.col("sigma").fill_null(med).clip(lower_bound=SIGMA_FLOOR))
+
+
+def _prepare(band: pl.LazyFrame, edges: tuple[float, ...],
+             sigma: pl.DataFrame | None) -> pl.LazyFrame:
+    """去重 + 逐行派生 sc / d(bps) / 分箱尺度 / bin / key。
+
+    sigma 为 None 时按固定 bps 分箱；否则先用 `d/σ` 归一化再按倍数切桶。
+    """
+    lf = (
         band.unique(subset=["bucket", "side", "px"], keep="any")
         .with_columns(
             pl.when(pl.col("side") == "ask").then(1).otherwise(0)
             .cast(pl.Int8).alias("sc"),
-            (((pl.col("px") - pl.col("mid")) / pl.col("mid")) * 1e4).abs().alias("d"),
+            (((pl.col("px") - pl.col("mid")) / pl.col("mid")) * 1e4).abs().alias("d_bps"),
         )
-        .with_columns(_bin_expr(pl.col("d")).alias("b"))
-        .with_columns(
-            (pl.col("sc") * 8 + pl.col("b")).cast(pl.Int16).alias("key"),
+    )
+    if sigma is not None:
+        lf = lf.join(sigma.lazy(), on="bucket", how="left").with_columns(
+            (pl.col("d_bps") / pl.col("sigma")).alias("scal")
         )
+    else:
+        lf = lf.with_columns(pl.col("d_bps").alias("scal"))
+
+    return (
+        lf.with_columns(_bin_expr(pl.col("scal"), edges).alias("b"))
+        .with_columns((pl.col("sc") * 8 + pl.col("b")).cast(pl.Int16).alias("key"))
     )
 
 
-def _bin_agg(band: pl.LazyFrame) -> pl.DataFrame:
+def _bin_agg(band: pl.LazyFrame, edges: tuple[float, ...],
+             sigma: pl.DataFrame | None) -> pl.DataFrame:
     """唯一的重活：150M 行 -> ~430K 行。流式引擎优先，不支持时退回内存引擎。"""
-    agg = _prepare(band).group_by(["bucket", "key"]).agg(
+    agg = _prepare(band, edges, sigma).group_by(["bucket", "key"]).agg(
         pl.col("q").sum().alias("q_sum"),
         pl.len().cast(pl.Int32).alias("n"),
         (pl.col("q") * pl.col("px")).sum().alias("qx"),
         pl.col("q").max().alias("q_max"),
         (pl.col("q") ** 2).sum().alias("q2"),
-        pl.col("d").sort_by(pl.col("q"), descending=True).first().alias("d_at_maxq"),
+        # 距离用 bps（人看得懂），不用归一化后的无量纲值
+        pl.col("d_bps").sort_by(pl.col("q"), descending=True).first().alias("d_at_maxq"),
         pl.col("mid").first().alias("mid"),
     )
     last = None
@@ -138,12 +181,13 @@ def _side_totals(bin_agg: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _pivot_bins(bin_agg: pl.DataFrame) -> pl.DataFrame:
+def _pivot_bins(bin_agg: pl.DataFrame, bin_names: tuple[str, ...]) -> pl.DataFrame:
     """分箱量 / 档数 / 分箱 VWAP(相对 mid 的 bps) 转宽表。
 
     pivot 输出列名是 `{value}_{key}`，这里显式改名成 `ob_q_bid_b0` 这类，
     不依赖隐含规则。某分钟某箱为空 -> 量与档数补 0，VWAP 保持 null（真没深度）。
     """
+    idx = {str(i): n for i, n in enumerate(bin_names)}
     wide = (
         bin_agg.with_columns(
             pl.when(pl.col("key") // 8 == 0).then(pl.lit("bid"))
@@ -153,13 +197,13 @@ def _pivot_bins(bin_agg: pl.DataFrame) -> pl.DataFrame:
         )
         .with_columns(
             (pl.col("side") + "_" + (pl.col("key") % 8).cast(pl.Utf8)
-             .replace_strict(BIN_IDX)).alias("k")
+             .replace_strict(idx)).alias("k")
         )
         .pivot(on="k", index="bucket", values=["q_sum", "n", "vwap_bps"])
     )
     ren = {}
     for s in ("bid", "ask"):
-        for bn in BIN_NAMES:
+        for bn in bin_names:
             ren[f"q_sum_{s}_{bn}"] = f"ob_q_{s}_{bn}"
             ren[f"n_{s}_{bn}"] = f"ob_n_{s}_{bn}"
             ren[f"vwap_bps_{s}_{bn}"] = f"ob_vwap_{s}_{bn}_bps"
@@ -169,34 +213,49 @@ def _pivot_bins(bin_agg: pl.DataFrame) -> pl.DataFrame:
         wide = wide.with_columns([pl.lit(None).alias(c) for c in missing])
     return wide.with_columns([
         pl.col(f"ob_q_{s}_{bn}").fill_null(0.0)
-        for s in ("bid", "ask") for bn in BIN_NAMES
+        for s in ("bid", "ask") for bn in bin_names
     ] + [
         pl.col(f"ob_n_{s}_{bn}").fill_null(0)
-        for s in ("bid", "ask") for bn in BIN_NAMES
+        for s in ("bid", "ask") for bn in bin_names
     ])
 
 
-def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None) -> pl.DataFrame:
+def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None,
+             bin_mode: str = "bps") -> pl.DataFrame:
     """单个 band(+mid) 文件 -> 分钟截面特征表（主键 close_time）。
+
+    bin_mode="bps"：历史口径，按固定 bps 距离分箱（b0..b4）。
+    bin_mode="vol"：按 `距离 / σ_t` 的波动率倍数分箱（v0..v4），并多输出
+    `ob_sigma_bps`（当期 1 分钟波动尺度）。两种口径都是 5 个桶、列数一致。
 
     `limit_rows` 只用于本地冒烟测试：截取文件最前面的 N 行跑通逻辑，避免在
     本地对 1.5 亿行做聚合（那是 Kaggle 的活）。全量计算必须走流式引擎。
     """
+    if bin_mode not in BIN_MODES:
+        raise SystemExit(f"unknown bin_mode: {bin_mode}")
+    edges, names = BIN_MODES[bin_mode]
+    near, upto10, far = _groups(bin_mode)
+
     mid = (
         pl.scan_parquet(str(mid_path))
         .unique(subset=["bucket"], keep="any")
         .select("bucket", "mid", "spread")
         .collect()
+        .sort("bucket")
     )
+    sigma = _sigma_from_mid(mid) if bin_mode == "vol" else None
+
     band = pl.scan_parquet(str(band_path))
     if limit_rows is not None:
         band = band.head(limit_rows)
 
-    log("aggregating bins ...")
-    bin_agg = _bin_agg(band)
+    log(f"aggregating bins (mode={bin_mode}) ...")
+    bin_agg = _bin_agg(band, edges, sigma)
     log(f"bin rows: {bin_agg.height:,}")
 
-    df = _pivot_bins(bin_agg).join(mid, on="bucket", how="left")
+    df = _pivot_bins(bin_agg, names).join(mid, on="bucket", how="left")
+    if sigma is not None:
+        df = df.join(sigma.rename({"sigma": "ob_sigma_bps"}), on="bucket", how="left")
     for sc, s in ((0, "bid"), (1, "ask")):
         df = df.join(
             _side_totals(bin_agg).filter(pl.col("sc") == sc).select(
@@ -220,20 +279,21 @@ def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None) -> 
         (pl.col("spread") / pl.col("mid") * 1e4).alias("ob_spread_bps"),
         # ---- 不平衡 ----
         ((qb - qa) / (qb + qa)).alias("ob_obi_total"),
-        ((pl.col("ob_q_bid_b0") - pl.col("ob_q_ask_b0"))
-         / (pl.col("ob_q_bid_b0") + pl.col("ob_q_ask_b0"))).alias("ob_obi_b0"),
-        ((q("bid", NEAR) - q("ask", NEAR))
-         / (q("bid", NEAR) + q("ask", NEAR))).alias("ob_obi_near"),
-        ((q("bid", FAR) - q("ask", FAR))
-         / (q("bid", FAR) + q("ask", FAR))).alias("ob_obi_far"),
+        ((pl.col(f"ob_q_bid_{names[0]}") - pl.col(f"ob_q_ask_{names[0]}"))
+         / (pl.col(f"ob_q_bid_{names[0]}") + pl.col(f"ob_q_ask_{names[0]}")
+            )).alias(f"ob_obi_{names[0]}"),
+        ((q("bid", near) - q("ask", near))
+         / (q("bid", near) + q("ask", near))).alias("ob_obi_near"),
+        ((q("bid", far) - q("ask", far))
+         / (q("bid", far) + q("ask", far))).alias("ob_obi_far"),
         # ---- 价格（用 mid 锚定的 band VWAP，不用单档） ----
         (((pl.col("_qx_ask") / qa) * qb + (pl.col("_qx_bid") / qb) * qa) / (qb + qa)
          - pl.col("mid")).truediv(pl.col("mid")).mul(1e4).alias("ob_wmid_bps"),
         # ---- 冲击 / 形态 ----
-        (10.0 / q("bid", UP_TO_10)).alias("ob_impact_bid_bps_per_btc"),
-        (10.0 / q("ask", UP_TO_10)).alias("ob_impact_ask_bps_per_btc"),
-        (q("bid", NEAR) / qb).alias("ob_depth_conc_bid"),
-        (q("ask", NEAR) / qa).alias("ob_depth_conc_ask"),
+        (10.0 / q("bid", upto10)).alias("ob_impact_bid_bps_per_btc"),
+        (10.0 / q("ask", upto10)).alias("ob_impact_ask_bps_per_btc"),
+        (q("bid", near) / qb).alias("ob_depth_conc_bid"),
+        (q("ask", near) / qa).alias("ob_depth_conc_ask"),
         (pl.col("ob_n_bid") / pl.col("ob_n_ask")).alias("ob_levels_ratio"),
         (qb / pl.col("ob_n_bid")).alias("ob_qmean_bid"),
         (qa / pl.col("ob_n_ask")).alias("ob_qmean_ask"),
@@ -275,6 +335,8 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit-rows", type=int, default=None,
                     help="只读前 N 行做本地冒烟测试；不传则全量")
+    ap.add_argument("--bin-mode", choices=("bps", "vol"), default="bps",
+                    help="bps=固定 bps 距离分箱(历史口径)；vol=按当期波动率倍数分箱")
     ap.add_argument("--force", action="store_true",
                     help="确认在本地跑全量（>256MB 的 band）。默认拒绝，避免占满本机")
     args = ap.parse_args()
@@ -287,7 +349,8 @@ def main() -> None:
             "全量请放到 Kaggle 内核上跑（确认过再 --force）。"
         )
 
-    df = build_l1(Path(args.band), Path(args.mid), limit_rows=args.limit_rows)
+    df = build_l1(Path(args.band), Path(args.mid), limit_rows=args.limit_rows,
+                  bin_mode=args.bin_mode)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(args.out)
     log(f"wrote {args.out}: {df.height:,} rows x {df.width} cols")
