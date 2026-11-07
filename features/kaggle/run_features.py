@@ -203,9 +203,9 @@ def main():
     if not os.path.isdir(ROOT / ".git"):
         subprocess.run(["git", "clone", REPO, str(ROOT)], check=True)
 
-    # 1) vision-base：全部月份（54MB，小）
-    for m in months():
-        n = f"{SYMBOL}_base_features_{m}.parquet"
+    # 1) vision-base：原始 1m K 线，按自然年发布（每标的每年一个文件）
+    for y in sorted({m[:4] for m in months()}):
+        n = f"{SYMBOL}_1m_klines_{y}.parquet"
         download(f"{DL_BASE}/vision-base/{n}", VIS / n)
 
     # 2) 逐月 L1（futures + spot），算完删 band+mid
@@ -238,9 +238,9 @@ def main():
                                                   L1 / f"ob_features_{ex}_{m}.parquet"),
                   flush=True)
 
-    # 3) 全序列 rolling + 合并 + 校验（build_dataset 内部用 glob 展开月度文件）
+    # 3) 全序列 rolling + 合并 + 校验（build_dataset 内部用 glob 展开）
     run("features/build_dataset.py",
-        "--vision", str(VIS / f"{SYMBOL}_base_features_*.parquet"),
+        "--vision", str(VIS / f"{SYMBOL}_1m_klines_*.parquet"),
         "--fut", str(L1 / "ob_features_binance_futures_*.parquet"),
         "--spot", str(L1 / "ob_features_binance_spot_*.parquet"),
         "--out-dir", str(MERGED))

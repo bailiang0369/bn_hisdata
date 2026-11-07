@@ -3,7 +3,7 @@
 
 数据流
 ------
-vision-base  {SYMBOL}_base_features_{YYYY-MM}.parquet   (close_time, 19 列)
+vision-base  {SYMBOL}_1m_klines_{YYYY}.parquet   (close_time, 15 列，逐年)
 ob L1        ob_features_{exchange}_{YYYY-MM}.parquet   (ob_features.py 产物)
                     │ 全窗口拼接 -> reindex -> 滚动（跨月无边界截断）
                     ▼
@@ -30,7 +30,7 @@ merged 里保留为一行（vision 有该分钟），ob_* 列置 null 并带 ob_
 用法
 ----
     python features/build_dataset.py \
-        --vision 'data/vision/BTCUSDT_base_features_*.parquet' \
+        --vision 'data/vision/BTCUSDT_1m_klines_*.parquet' \
         --fut 'data/ob/ob_features_binance_futures_*.parquet' \
         --spot 'data/ob/ob_features_binance_spot_*.parquet' \
         --out-dir data/merged
@@ -227,10 +227,11 @@ def validate(df: pl.DataFrame, n_vision: int) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vision", required=True, help="glob: BTCUSDT_base_features_*.parquet")
+    ap.add_argument("--vision", required=True, help="glob: BTCUSDT_1m_klines_*.parquet")
     ap.add_argument("--fut", required=True, help="glob: ob_features_binance_futures_*.parquet")
     ap.add_argument("--spot", default=None, help="glob: ob_features_binance_spot_*.parquet")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--symbol", default="BTCUSDT", help="输出文件名用的标的（默认 BTCUSDT，向后兼容）")
     args = ap.parse_args()
 
     vision_files = sorted(glob.glob(args.vision))
@@ -260,7 +261,7 @@ def main() -> None:
         out = _atkdef_features(out)
         out = _sanitize(out)
         rep = validate(out, v.height)
-        fp = out_dir / f"merged_BTCUSDT_{m}.parquet"
+        fp = out_dir / f"merged_{args.symbol}_{m}.parquet"
         out.write_parquet(fp)
         log(f"merged {m}: {fp.name} | {rep}")
 

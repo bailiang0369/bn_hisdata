@@ -1,66 +1,73 @@
 #!/usr/bin/env python3
-"""本地推送 Kaggle 内核（仅本地使用，不进 kernel）。
+"""本地推送 Kaggle 内核 —— kaggle-kit 的 direct 模式薄封装（保留旧参数写法）。
 
-Kaggle script kernel 只上传 code_file 一个文件、metadata 也不支持 env，
-所以这里把 `--env K=V` 直接注入到代码首行（与 bn_bt/kaggle_launcher.py 的做法一致）。
+内部转调 `kaggle-kit/kk.py push --mode direct`，参数名一一对应：
+    --code            -> --entry
+    --dataset-source  -> --dataset-in
 
 用法:
     python tools/push_kernel.py \
         --code features/kaggle/run_eth.py \
-        --slug byh850515/btcusdt-eth-orderbook-features \
+        --slug byh850515/ethusdt-orderbook-features \
         --title "ETHUSDT Orderbook Features" \
-        --env MODE=probe --env OB_SYMBOL=ETHUSDT
+        --env MODE=build --env-from CHD_API_KEY
 
-注意：CHD_API_KEY 等凭据**不要**用 --env 传（会写进公开内核）。
-请在 Kaggle 内核页 Settings -> Secrets 里 attach 同名 secret。
+凭据一律用 `--env-from NAME`（从本地环境变量取值，不进命令行/日志）；
+不要用 `--env CHD_API_KEY=明文`。凭据会写进私有 kernel 的 code_file 首行，
+这是刻意的——Kaggle Secret 是 kernel 设置，`kernels push` 会覆盖它，一重推就丢；
+写进 code_file 则重推照样有效，自动化链路才不会断。前提：kernel 必须私有。
 """
 import argparse
-import json
 import os
 import subprocess
-import tempfile
+import sys
+from pathlib import Path
+
+
+def find_kk() -> Path:
+    """按 环境变量 -> 上级目录 -> 已安装 skill 的顺序找 kk.py。"""
+    cands: list[Path] = []
+    env = os.environ.get("KK_PY")
+    if env:
+        cands.append(Path(env))
+    here = Path(__file__).resolve()
+    for base in here.parents:
+        cands.append(base / "kaggle-runner" / "scripts" / "kk.py")
+        cands.append(base / "kaggle-kit" / "kk.py")   # 旧路径，留作兼容
+    cands.append(Path.home() / ".codebuddy" / "skills" / "kaggle-runner" / "scripts" / "kk.py")
+    for c in cands:
+        if c.is_file():
+            return c
+    raise SystemExit("找不到 kk.py：请设置 KK_PY，或先运行 `python kk.py install-skill`")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--code", required=True, help="本地内核脚本路径")
+    ap.add_argument("--code", required=True, help="本地内核脚本路径（相对当前目录）")
     ap.add_argument("--slug", required=True, help="username/kernel-slug")
     ap.add_argument("--title", required=True)
-    ap.add_argument("--env", action="append", default=[], help="K=V，可重复")
-    ap.add_argument("--dataset-source", action="append", default=[])
+    ap.add_argument("--env", action="append", default=[], help="K=V，可重复（非敏感值）")
+    ap.add_argument("--env-from", action="append", default=[],
+                    help="从本地环境变量取值注入（凭据用这个），可重复")
+    ap.add_argument("--dataset-source", action="append", default=[], help="挂载的 dataset，可重复")
     ap.add_argument("--no-internet", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="只生成并打印，不推送")
     a = ap.parse_args()
 
-    code = open(a.code, encoding="utf-8").read()
-    inject = "\n".join(
-        f"_os.environ[{k!r}] = {v!r}"
-        for k, _, v in (e.partition("=") for e in a.env)
-    )
-    staged = "import os as _os\n" + (inject + "\n" if inject else "") + code
+    cmd = [sys.executable, str(find_kk()), "push", "--mode", "direct",
+           "--entry", a.code, "--slug", a.slug, "--title", a.title]
+    for item in a.env:
+        cmd += ["--env", item]
+    for name in a.env_from:
+        cmd += ["--env-from", name]
+    for ds in a.dataset_source:
+        cmd += ["--dataset-in", ds]
+    if a.no_internet:
+        cmd.append("--no-internet")
+    if a.dry_run:
+        cmd.append("--dry-run")
 
-    d = tempfile.mkdtemp(prefix="kaggle_push_")
-    name = "kernel_main.py"
-    with open(os.path.join(d, name), "w", encoding="utf-8") as f:
-        f.write(staged)
-    meta = {
-        "id": a.slug,
-        "title": a.title,
-        "code_file": name,
-        "language": "python",
-        "kernel_type": "script",
-        "is_private": True,
-        "enable_gpu": False,
-        "enable_internet": not a.no_internet,
-        "dataset_sources": a.dataset_source,
-        "competition_sources": [],
-        "kernel_sources": [],
-    }
-    with open(os.path.join(d, "kernel-metadata.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
-
-    print(f"[stage] {d}")
-    print(f"[push] {a.slug}")
-    return subprocess.run(["kaggle", "kernels", "push", "-p", d]).returncode
+    return subprocess.run(cmd).returncode
 
 
 if __name__ == "__main__":

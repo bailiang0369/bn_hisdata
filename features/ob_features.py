@@ -58,7 +58,12 @@ import polars as pl
 #        —— 周末低波动时 2bps 就算"远"，美股开盘前后 20bps 可能只是"近"，固定 bps 表达不了。
 BIN_MODES = {
     "bps": ((2.0, 5.0, 10.0, 20.0), ("b0", "b1", "b2", "b3", "b4")),
+    # vol：0.5/1/2/4 倍 sigma；vol8：1/2/4/8 倍 —— sigma 中位数约 3.8bps、band 到 30bps
+    # （≈8σ），用 4σ 封顶会把近一半挂单挤进最后一桶，8σ 才覆盖满 band。
     "vol": ((0.5, 1.0, 2.0, 4.0), ("v0", "v1", "v2", "v3", "v4")),
+    "vol8": ((1.0, 2.0, 4.0, 8.0), ("v0", "v1", "v2", "v3", "v4")),
+    # vol02：0.2/0.5/1/2 倍 sigma，贴价侧重（σ≈3.8bps 时 2σ≈7.6bps）
+    "vol02": ((0.2, 0.5, 1.0, 2.0), ("v0", "v1", "v2", "v3", "v4")),
 }
 BIN_EDGES, BIN_NAMES = BIN_MODES["bps"]      # 默认口径，保持向后兼容
 SIGMA_WINDOW = 30        # 波动尺度：过去 N 个 1 分钟对数收益的标准差
@@ -225,8 +230,8 @@ def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None,
     """单个 band(+mid) 文件 -> 分钟截面特征表（主键 close_time）。
 
     bin_mode="bps"：历史口径，按固定 bps 距离分箱（b0..b4）。
-    bin_mode="vol"：按 `距离 / σ_t` 的波动率倍数分箱（v0..v4），并多输出
-    `ob_sigma_bps`（当期 1 分钟波动尺度）。两种口径都是 5 个桶、列数一致。
+    bin_mode="vol"/"vol8"：按 `距离 / σ_t` 的波动率倍数分箱（v0..v4），并多输出
+    `ob_sigma_bps`（当期 1 分钟波动尺度）。所有口径都是 5 个桶、列数一致。
 
     `limit_rows` 只用于本地冒烟测试：截取文件最前面的 N 行跑通逻辑，避免在
     本地对 1.5 亿行做聚合（那是 Kaggle 的活）。全量计算必须走流式引擎。
@@ -243,7 +248,8 @@ def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None,
         .collect()
         .sort("bucket")
     )
-    sigma = _sigma_from_mid(mid) if bin_mode == "vol" else None
+    # 除了 "bps" 以外都是波动率口径（vol / vol8 ...），都要先算 sigma
+    sigma = _sigma_from_mid(mid) if bin_mode != "bps" else None
 
     band = pl.scan_parquet(str(band_path))
     if limit_rows is not None:
@@ -335,8 +341,8 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit-rows", type=int, default=None,
                     help="只读前 N 行做本地冒烟测试；不传则全量")
-    ap.add_argument("--bin-mode", choices=("bps", "vol"), default="bps",
-                    help="bps=固定 bps 距离分箱(历史口径)；vol=按当期波动率倍数分箱")
+    ap.add_argument("--bin-mode", choices=tuple(BIN_MODES), default="bps",
+                    help="bps=固定 bps；vol=0.5/1/2/4σ；vol8=1/2/4/8σ；vol02=0.2/0.5/1/2σ")
     ap.add_argument("--force", action="store_true",
                     help="确认在本地跑全量（>256MB 的 band）。默认拒绝，避免占满本机")
     args = ap.parse_args()

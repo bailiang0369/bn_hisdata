@@ -22,9 +22,12 @@ def _mock_klines():
         "sell_vol": [5.0, 8.0],
         "count": [100, 120],
     })
-    # Mock Spot 1m Klines
+    # Mock Spot 1m Klines（1m K 线天然带 OHLC，现货也一样）
     df_spot = pl.DataFrame({
         "close_time": [t1, t2],
+        "open": [99.5, 101.0],
+        "high": [100.5, 102.5],
+        "low": [99.0, 100.8],
         "close": [100.0, 102.0],
         "buy_vol": [8.0, 12.0],
         "sell_vol": [4.0, 6.0],
@@ -34,6 +37,7 @@ def _mock_klines():
 
 
 def _mock_metrics():
+    """5m metrics 原始帧（构建时已不再消费，保留以断言这些列不会混进基础表）。"""
     t1 = 1700000040000
     return pl.DataFrame({
         "create_time": [t1 - 300000],
@@ -79,14 +83,22 @@ def test_build_master_feature_table_basic():
         df_um, df_spot,
         df_aggtrades_um=_mock_aggtrades_um(),
         df_aggtrades_spot=_mock_aggtrades_spot(),
-        df_metrics=_mock_metrics(),
     )
     assert len(master) == 2
-    assert "basis" in master.columns
-    assert "basis_rate" not in master.columns
+    # basis 不进基础表：合约 close 与现货 close 都在，下游随时能算
+    assert "basis" not in master.columns
+    assert "basis_bps" not in master.columns
     assert "create_time" not in master.columns
-    assert master["basis"][0] == pytest.approx(3.0)
-    assert master["sum_open_interest"][0] == pytest.approx(1000.0)
+    # 现货 OHLC 必须保留（只留 close 会丢掉现货振幅/收盘位置）
+    for c in ("spot_open", "spot_high", "spot_low", "spot_close"):
+        assert c in master.columns
+    assert master["spot_high"][0] == pytest.approx(100.5)
+    # 5m metrics 5 列一律不出现：5 分钟一档 + 再滞后 5m，对 3 分钟方向无信息
+    for c in ("sum_open_interest", "sum_open_interest_value",
+              "count_toptrader_long_short_ratio", "sum_toptrader_long_short_ratio",
+              "count_long_short_ratio", "sum_taker_long_short_vol_ratio"):
+        assert c not in master.columns
+    assert len(_mock_metrics().columns) == 7  # 源端确实有这些列，构建时被丢弃
     # 两个市场的微观特征必须带前缀真的 join 上（2026-10 修复的静默缺失）
     for c in ("um_agg_vwap_disparity", "um_agg_price_robust_zscore",
               "um_agg_rv", "um_agg_dt_std",
@@ -106,20 +118,22 @@ def test_build_master_feature_table_basic():
 
 
 def test_build_master_feature_table_no_agg():
-    """基础宽表：无 aggTrades 时核心列齐全、微观列缺席（--no-agg 路径）。"""
+    """基础宽表：默认路径（不启用 aggTrades）核心列齐全、微观列缺席。"""
     df_um, df_spot = _mock_klines()
     master = build_master_feature_table(df_um, df_spot, df_aggtrades_um=None,
-                                        df_aggtrades_spot=None, df_metrics=None)
+                                        df_aggtrades_spot=None)
     assert len(master) == 2
-    # 核心列必须在
-    for c in ("close_time", "close", "spot_close", "basis", "um_buy_vol",
-              "um_sell_vol", "spot_buy_vol", "spot_sell_vol", "um_count", "spot_count"):
-        assert c in master.columns
+    # 基础表就是 15 列：恰好这些，多一列都不行
+    expect = ("close_time", "open", "high", "low", "close",
+              "um_buy_vol", "um_sell_vol", "um_count",
+              "spot_open", "spot_high", "spot_low", "spot_close",
+              "spot_buy_vol", "spot_sell_vol", "spot_count")
+    assert master.columns == list(expect)
+    assert master.width == 15
     # 微观列必须缺席
     for c in ("um_agg_rv", "spot_agg_rv", "um_agg_vwap_disparity",
-              "spot_agg_vwap_disparity", "rv_dominance"):
+              "spot_agg_vwap_disparity", "rv_dominance", "basis"):
         assert c not in master.columns
-    assert master["basis"][0] == pytest.approx(3.0)
 
 
 def test_build_master_feature_table_um_only_agg():

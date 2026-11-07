@@ -67,6 +67,54 @@ def _add_rolling(df: pl.DataFrame, label: str, period: str) -> pl.DataFrame:
     return pl.concat([df, agg], how="horizontal")
 
 
+# 波动率分桶边界：桶边界 = 最近 7 天 |1m 收益| 中位数 × 这些倍率。
+# 6 档（0..5）：<0.8 / 0.8~1.0 / 1.0~1.25 / 1.25~1.6 / 1.6~2.0 / >=2.0 倍。
+VOL_MULTS = (0.8, 1.0, 1.25, 1.6, 2.0)
+VOL_BASE_WIN = "7d"    # 基准尺度窗口
+VOL_CUR_WIN = "60m"    # 当前尺度窗口
+
+
+def _add_vol_bucket(df: pl.DataFrame) -> pl.DataFrame:
+    """按「最近波动率中位数 × 倍率」切波动档，桶边界随波动水平整体平移。
+
+    为什么不用固定 bps 阈值：周末低波动时 1~2bp 已算"大波动"，消息面/美股开盘
+    前后 20bp 也可能只是常态。用相对尺度（当前 / 最近 7 天中位数）分档，档位在
+    不同时段之间可比。
+
+    尺度统一取 1 分钟收益绝对值的中位数（bps）：
+      ob_vol_med_7d_bps   过去 7 天中位数，shift(1) 后才是严格因果的基准
+      ob_vol_med_60m_bps  最近 60 分钟中位数（当前尺度）
+      ob_vol_ratio        当前 / 基准
+      ob_vol_bucket       0..5，ratio 落在 VOL_MULTS 的哪一段
+      ob_ret_vol_norm     1m 收益 / 基准中位数，跨波动时段可比的收益幅度
+    """
+    src = df.with_columns(
+        pl.col("ob_ret_1m_bps").abs().alias("_absret"),
+        pl.from_epoch(pl.col("close_time"), time_unit="ms").alias("_ts"),
+    ).select(["_ts", "_absret"])
+    m7 = src.rolling(index_column="_ts", period=VOL_BASE_WIN).agg(
+        pl.col("_absret").median().alias("_m7")).drop("_ts")
+    m60 = src.rolling(index_column="_ts", period=VOL_CUR_WIN).agg(
+        pl.col("_absret").median().alias("_m60")).drop("_ts")
+    out = pl.concat([df, m7, m60], how="horizontal").with_columns(
+        pl.col("_m7").shift(1).alias("ob_vol_med_7d_bps"),
+        pl.col("_m60").alias("ob_vol_med_60m_bps"),
+    )
+    out = out.with_columns(
+        (pl.col("ob_vol_med_60m_bps") / pl.col("ob_vol_med_7d_bps")).alias("ob_vol_ratio")
+    )
+    ratio = pl.col("ob_vol_ratio")
+    bucket = pl.lit(len(VOL_MULTS), dtype=pl.Int8)
+    # 从大到小套 when：最外层是最低阈值，判断顺序自然变成 0 -> n
+    for i in range(len(VOL_MULTS) - 1, -1, -1):
+        bucket = pl.when(ratio < VOL_MULTS[i]).then(pl.lit(i, dtype=pl.Int8)).otherwise(bucket)
+    out = out.with_columns(
+        bucket.alias("ob_vol_bucket"),
+        (pl.col("ob_ret_1m_bps") / pl.col("ob_vol_med_7d_bps")).alias("ob_ret_vol_norm"),
+    )
+    return out.drop(["_m7", "_m60"])
+
+
 def _sanitize(df: pl.DataFrame) -> pl.DataFrame:
     """把 inf / -inf / NaN 统一置 null，避免除零产生的非常数静默污染下游模型。"""
     cols = [c for c in df.columns if df[c].dtype in (pl.Float32, pl.Float64)]
@@ -107,6 +155,7 @@ def build_l2(df: pl.DataFrame) -> pl.DataFrame:
         ((pl.col("ob_spread_bps") - pl.col("ob_spread_mean_15m"))
          / pl.col("ob_spread_std_15m")).alias("ob_spread_z_15m"),
     )
+    df = _add_vol_bucket(df)
     return _sanitize(df.drop(["_impact"]))
 
 

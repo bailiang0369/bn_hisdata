@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 魔搭 ModelScope Notebook：基础宽表生成
-#   基础宽表 = um+spot 1m klines + basis + metrics（--no-agg，13+6 列）
-#   aggTrades / orderbook 只贡献衍生特征、下载量大，留第二阶段，本脚本不碰
-#   （第二阶段见同目录 run_aggtrades_cloud.sh）。
+#   基础宽表 = um+spot 1m klines（含现货 OHLC），15 列，默认路径
+#   metrics / aggTrades / orderbook 均已判定不做或留第二阶段，本脚本不碰
+#   （aggTrades 第二阶段见同目录 run_aggtrades_cloud.sh）。
 #
 # 设计原则（2026-10-20 修正版）：
 #   - 所有数据落在 /mnt/workspace（持久化存储，100GB 配额），不碰 /root
@@ -68,14 +68,11 @@ python binance_vision/download_binance_vision.py --market both --symbol all \
     --category klines --interval 1m --granularity daily \
     --start-date "$DAILY_START" --end-date "$DAILY_END" -j "$JOBS"
 
-# ---- metrics 日度（仅 um；spot 无 metrics，会自动跳过）-------------------------
-python binance_vision/download_binance_vision.py --market um --symbol all \
-    --category metrics --granularity daily \
-    --start-date "$START" --end-date "$DAILY_END" -j "$JOBS"
+# ---- metrics 不再下载（5 分钟粒度 + 滞后回填，2026-11 判定无信息）--------------
 
-# ---- 构建基础宽表（--no-agg：aggTrades 放第二阶段）----------------------------
-python binance_vision/build_master_features.py --symbol BTCUSDT --no-agg
-python binance_vision/build_master_features.py --symbol ETHUSDT --no-agg
+# ---- 构建 K 线基础表（默认路径：15 列，不碰 aggTrades/metrics）-----------------
+python binance_vision/build_master_features.py --symbol BTCUSDT
+python binance_vision/build_master_features.py --symbol ETHUSDT
 
 # ---- 结果取回：默认不 push ------------------------------------------------------
 echo "== DONE =="

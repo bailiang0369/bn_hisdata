@@ -73,14 +73,12 @@ run([sys.executable, f"{BV}/download_binance_vision.py", "--market", "both",
      "--symbol", sym, "--category", "klines", "--interval", "1m",
      "--granularity", "daily", "--start-date", "2026-10-01",
      "--end-date", END, "-j", JOBS])
-# 3) metrics 日度（仅 um；spot 会自动跳过）
-run([sys.executable, f"{BV}/download_binance_vision.py", "--market", "um",
-     "--symbol", sym, "--category", "metrics", "--granularity", "daily",
-     "--start-date", START, "--end-date", END, "-j", JOBS])
+# 3) metrics 不再下载：5 分钟粒度 + 滞后回填，2026-11 判定对 3 分钟方向无信息
+#    （见 DATA_ACCESS §3.1）。需要时单独 --category metrics 手动补。
 
-# 4) 构建 base 宽表（--no-agg）
+# 4) 构建 K 线基础表（默认路径：15 列，不含 aggTrades / metrics）
 for s in SYMBOLS:
-    run([sys.executable, f"{BV}/build_master_features.py", "--symbol", s, "--no-agg"])
+    run([sys.executable, f"{BV}/build_master_features.py", "--symbol", s])
 
 # 5) 按月拆分 + 上传 GitHub release vision-base
 import requests

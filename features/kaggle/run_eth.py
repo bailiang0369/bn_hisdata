@@ -41,6 +41,9 @@ START = os.environ.get("START", "2025-07-01")
 END = os.environ.get("END", "2026-10-20")
 MODE = os.environ.get("MODE", "probe").strip().lower()
 MAX_DAYS = int(os.environ.get("MAX_DAYS", "2"))
+RETRY = int(os.environ.get("RETRY", "3"))   # 逐日下载的重试次数（7 小时任务必备）
+# 缺天容忍上限：超过这个比例就认为不是零星缺数据，而是数据源/网络整体异常
+MAX_SKIP_RATIO = float(os.environ.get("MAX_SKIP_RATIO", "0.1"))
 
 EXCHANGES = ("binance_futures", "binance_spot")
 
@@ -55,18 +58,32 @@ def sh(cmd, **kw):
 
 
 def secret(name: str):
+    """环境变量优先；否则读 Kaggle Secrets。
+
+    get_secret 在容器刚启动时偶发 ConnectionError（v5 就是这么挂的），
+    重试 3 次再判定缺失，避免把网络抖动当成"没配"。
+    """
     v = os.environ.get(name)
     if v:
         return v
-    try:
+    last = None
+    for attempt in range(1, 4):
         try:
-            from kaggle_secrets import UserSecretsClient as _C
-        except ImportError:
-            from kaggle_secrets import UserSecretClient as _C
-        return _C().get_secret(name)
-    except Exception as exc:  # noqa: BLE001
-        log(f"secret {name} unavailable ({type(exc).__name__})")
-        return None
+            try:
+                from kaggle_secrets import UserSecretsClient as _C
+            except ImportError:
+                from kaggle_secrets import UserSecretClient as _C
+            val = _C().get_secret(name)
+            if val:
+                return val
+            last = RuntimeError("empty secret")
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+        if attempt < 3:
+            log(f"secret {name} 第 {attempt} 次读取失败（{type(last).__name__}），{5 * attempt}s 后重试")
+            time.sleep(5 * attempt)
+    log(f"secret {name} unavailable ({type(last).__name__})")
+    return None
 
 
 def months(start: str, end: str) -> list[str]:
@@ -177,9 +194,9 @@ def build(key: str, max_days: int) -> int:
     for p in (data, vis, monthly, l1, merged):
         p.mkdir(parents=True, exist_ok=True)
 
-    # 1) vision-base（K线+基差+metrics，含 ETHUSDT）
-    for m in months(START, END):
-        n = f"{SYMBOL}_base_features_{m}.parquet"
+    # 1) vision-base：原始 1m K 线，按自然年发布（每标的每年一个文件）
+    for y in sorted({m[:4] for m in months(START, END)}):
+        n = f"{SYMBOL}_1m_klines_{y}.parquet"
         download(f"{DL_BASE}/vision-base/{n}", vis / n)
 
     env = dict(os.environ, OB_SYMBOL=SYMBOL, CHD_API_KEY=key)
@@ -190,11 +207,41 @@ def build(key: str, max_days: int) -> int:
         todo = todo[:max_days]
     log(f"构建 band：{len(todo)} 天（{todo[0]} ~ {todo[-1]}）")
     t0 = time.time()
-    for d in todo:
-        sh([sys.executable, "orderbook/pipeline.py", "--date", d,
-            "--download", "r2", "--mode", "dense", "--dest-root", str(data)],
-           cwd=str(ROOT), env=env)
+    retry = RETRY
+    skipped: list[str] = []
+    for idx, d in enumerate(todo, 1):
+        ok = False
+        for attempt in range(1, retry + 1):
+            try:
+                sh([sys.executable, "orderbook/pipeline.py", "--date", d,
+                    "--download", "r2", "--mode", "dense", "--dest-root", str(data)],
+                   cwd=str(ROOT), env=env)
+                ok = True
+                break
+            except subprocess.CalledProcessError as exc:
+                # pipeline 按天幂等（已存在的 band 会跳过），重试不会重复劳动；
+                # v4 是 binance_spot 某小时 ProtocolError 整段崩掉，
+                # v7 是数据源本身缺天（2026-03-31 futures 缺失）——后者重试无意义，
+                # 所以重试耗尽后记 skip 继续，不要让一天毁掉整轮几百天。
+                if attempt < retry:
+                    wait = 15 * attempt
+                    log(f"WARN {d} 第 {attempt}/{retry} 次失败 rc={exc.returncode}，{wait}s 后重试")
+                    time.sleep(wait)
+        if not ok:
+            skipped.append(d)
+            log(f"SKIP {d}：重试 {retry} 次仍失败（多半是数据源缺天），继续下一天")
+        if idx % 10 == 0 or idx == len(todo):
+            log(f"进度 {idx}/{len(todo)} 天，用时 {time.time() - t0:.0f}s，跳过 {len(skipped)}")
     log(f"band 完成，用时 {time.time() - t0:.0f}s")
+
+    if skipped:
+        ratio = len(skipped) / len(todo)
+        log(f"跳过 {len(skipped)}/{len(todo)} 天（{ratio:.1%}）：{skipped[:15]}"
+            + (" ..." if len(skipped) > 15 else ""))
+        (WORK / "eth_skipped_days.txt").write_text("\n".join(skipped), encoding="utf-8")
+        if ratio > MAX_SKIP_RATIO:
+            log(f"跳过比例超过 {MAX_SKIP_RATIO:.0%}，判定为数据源/网络异常，不产出")
+            return 4
 
     built = sorted(data.glob("*/binance_futures_minute_band.parquet"))
     log(f"band 产物：{len(built)} 天，样本大小 "
@@ -228,7 +275,7 @@ def build(key: str, max_days: int) -> int:
         "--vision", str(vis / f"{SYMBOL}_base_features_*.parquet"),
         "--fut", str(l1 / "ob_features_binance_futures_*.parquet"),
         "--spot", str(l1 / "ob_features_binance_spot_*.parquet"),
-        "--out-dir", str(merged)],
+        "--out-dir", str(merged), "--symbol", SYMBOL],
        cwd=str(ROOT), env=env)
 
     # 6) 拼单文件 → /kaggle/working/eth_dataset/
