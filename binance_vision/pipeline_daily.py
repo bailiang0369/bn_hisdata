@@ -37,7 +37,6 @@ import argparse
 import io
 import os
 import re
-import sys
 import threading
 import time
 import zipfile
@@ -47,12 +46,6 @@ from pathlib import Path
 
 import polars as pl
 import requests
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from binance_vision.build_master_features import (  # noqa: E402
-    build_master_feature_table_lazy,
-)
 
 VISION = "https://data.binance.vision/data"
 GH_API = "https://api.github.com"
@@ -287,11 +280,30 @@ def _download(urls: dict[str, str], label: str, retries: int = 3) -> dict[str, b
 
 
 def _build_pair(raw: dict[str, bytes]) -> pl.DataFrame:
-    """um+spot 原始 klines -> 15 列基础表（close_time = 下一分钟起点）。"""
-    um = read_kline_zip(raw["um"])
-    spot = read_kline_zip(raw["spot"])
-    return (build_master_feature_table_lazy(um.lazy(), spot.lazy(), timeframe="1m")
-            .collect().sort("close_time").select(BASE_COLS))
+    """um+spot 原始 klines -> 15 列基础表（close_time = 下一分钟起点）。
+
+    刻意不 import build_master_features：那边还在迭代 aggTrades/metrics 相关的列，
+    而本管线的契约就是这 15 列，自己拼死比跟着上游变来变去更可靠。
+    """
+    um = (read_kline_zip(raw["um"])
+          .select([pl.col("close_time"),
+                   pl.col("open"), pl.col("high"), pl.col("low"), pl.col("close"),
+                   pl.col("buy_vol").alias("um_buy_vol"),
+                   pl.col("sell_vol").alias("um_sell_vol"),
+                   pl.col("count").alias("um_count")])
+          .unique(subset=["close_time"]))
+    spot = (read_kline_zip(raw["spot"])
+            .select([pl.col("close_time"),
+                     pl.col("open").alias("spot_open"),
+                     pl.col("high").alias("spot_high"),
+                     pl.col("low").alias("spot_low"),
+                     pl.col("close").alias("spot_close"),
+                     pl.col("buy_vol").alias("spot_buy_vol"),
+                     pl.col("sell_vol").alias("spot_sell_vol"),
+                     pl.col("count").alias("spot_count")])
+            .unique(subset=["close_time"]))
+    return (um.join(spot, on="close_time", how="inner")
+            .sort("close_time").select(BASE_COLS))
 
 
 def fetch_day(symbol: str, d: date, retries: int = 3) -> pl.DataFrame:
