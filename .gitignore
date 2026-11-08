@@ -14,3 +14,5 @@ __pycache__/
 .codebuddy/
 # kk（kaggle-runner）本地缓存：产物 + 嵌套克隆，不进仓库
 .kk/
+# 本地临时/验证脚手架（脚本、抽样 parquet、运行日志）
+tmp/
