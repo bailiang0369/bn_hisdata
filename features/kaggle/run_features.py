@@ -19,6 +19,7 @@ K 线不在这条链路里：基础 K 线特征由 vision / bn_bt 单独算，�
 断点续传：上传成功的月份资产下次运行直接跳过；band 下载用 HTTP Range 续传。
 """
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -47,13 +48,17 @@ OB_BIN_MODE = os.environ.get("OB_BIN_MODE", "vol8")
 L1_TAG = f"ob-features-{OB_BIN_MODE}"
 DS_TAG = f"ob-dataset-{OB_BIN_MODE}"
 
-WORK = Path("/kaggle/working")
+# 仓库克隆和中间产物都放 /tmp：/kaggle/working 是内核 output，放这里会把
+# 整个 repo（含 .git）当成产物打包上传，本地 pull 回来又是一堆本来就在手边的代码。
+WORK = Path("/tmp/ob_build")
 ROOT = WORK / "bn_hisdata"
 OB = WORK / "ob"
 L1 = WORK / "l1"
 DS = WORK / "ob_dataset"
 for p in (OB, L1, DS):
     p.mkdir(parents=True, exist_ok=True)
+# 只有这个目录（parquet）进 output
+OUT = Path("/kaggle/working/ob_dataset")
 
 
 def _secret(name: str):
@@ -253,11 +258,11 @@ def main():
     print(f"final: {final.name} {final.stat().st_size / 1e6:.1f} MB", flush=True)
     print(f"upload {final.name}", upload_replace(DS_TAG, final), flush=True)
 
-    # 清理中间目录，让 Kaggle output 只保留最终产物
-    import shutil
-    for d in (L1, OB):
-        shutil.rmtree(d, ignore_errors=True)
-    print(f"产物: {DS}/*.parquet", flush=True)
+    # 5) 只有 parquet 抄进 output（没有 token 时靠它把产物拉回本地）
+    OUT.mkdir(parents=True, exist_ok=True)
+    for fp in sorted(DS.glob("*.parquet")):
+        shutil.copy2(fp, OUT / fp.name)
+    print(f"output: {OUT} ({len(list(OUT.glob('*.parquet')))} 个 parquet)", flush=True)
     print("FEATURES DONE", flush=True)
 
 
