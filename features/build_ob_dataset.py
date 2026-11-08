@@ -54,8 +54,14 @@ def log(msg: str) -> None:
 
 
 def _ym(col: str = "close_time") -> pl.Expr:
-    """毫秒时间戳 -> 'YYYY-MM'（UTC）。"""
-    return pl.from_epoch(pl.col(col), time_unit="ms").dt.strftime("%Y-%m")
+    """毫秒时间戳 -> 'YYYY-MM'（UTC），按 **bar 起点**归月。
+
+    close_time = bucket + 60000 是 K 线的右端点，月末最后一分钟的 close_time
+    正好等于下月 1 号 00:00。直接按 close_time 归月会给下个月造出只有一个
+    时间点的文件（上传按已存在 skip，那个 1 行文件会永久占位），所以减 1ms
+    把它还原到该分钟所属的月份。
+    """
+    return pl.from_epoch(pl.col(col) - 1, time_unit="ms").dt.strftime("%Y-%m")
 
 
 def _prefix(df: pl.DataFrame, prefix: str) -> pl.DataFrame:

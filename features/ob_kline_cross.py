@@ -51,8 +51,12 @@ def log(msg: str) -> None:
 
 
 def _ym(col: str = "close_time") -> pl.Expr:
-    """毫秒时间戳 -> 'YYYY-MM'（UTC）。"""
-    return pl.from_epoch(pl.col(col), time_unit="ms").dt.strftime("%Y-%m")
+    """毫秒时间戳 -> 'YYYY-MM'（UTC），按 bar 起点归月（与 build_ob_dataset 一致）。
+
+    close_time = bucket + 60000 是右端点，月末最后一分钟等于下月 1 号 00:00，
+    减 1ms 还原到所属月份。
+    """
+    return pl.from_epoch(pl.col(col) - 1, time_unit="ms").dt.strftime("%Y-%m")
 
 
 def _amplitude(v: pl.DataFrame) -> pl.DataFrame:
