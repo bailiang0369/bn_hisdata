@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""从月度 band(+mid) 快照计算分钟级 L2 订单簿截面特征（L1）。
+"""从分钟级 band(+mid) 快照计算 L2 订单簿截面特征（L1）。
 
-输入（`data-merged` release 的月度 parquet）
-------------------------------------------
+输入（`data-YYYY-MM` release 的日包，或 `data-merged` 的月度文件）
+------------------------------------------------------------------
 band : bucket(Int64) side(str) px(Float64) q(Float32) mid(Float64)
     每分钟 × 每档一行，仅保留 mid ±0.3% 内的档位。
 mid  : bucket(Int64) best_bid best_ask mid spread（全部 Float64）
+
+`--band` / `--mid` 支持通配，可直接读一个月的日包（`data-YYYY-MM/{date}.zip`
+解压后的 30 个日 parquet）：日文件之间在边界重叠一分钟，`unique(bucket, side, px)`
+会去掉重复；`rolling_std` 跨文件续算，等价于月度文件。
 
 输出
 ----
@@ -50,6 +54,7 @@ mid  : bucket(Int64) best_bid best_ask mid spread（全部 Float64）
 from __future__ import annotations
 
 import argparse
+import glob
 import time
 from pathlib import Path
 
@@ -229,7 +234,8 @@ def _pivot_bins(bin_agg: pl.DataFrame, bin_names: tuple[str, ...]) -> pl.DataFra
     ])
 
 
-def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None,
+def build_l1(band_path: str | Path, mid_path: str | Path,
+             limit_rows: int | None = None,
              bin_mode: str = DEFAULT_BIN_MODE) -> pl.DataFrame:
     """单个 band(+mid) 文件 -> 分钟截面特征表（主键 close_time）。
 
@@ -342,8 +348,10 @@ def build_l1(band_path: Path, mid_path: Path, limit_rows: int | None = None,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--band", required=True, help="*_minute_band[_YYYY-MM].parquet")
-    ap.add_argument("--mid", required=True, help="*_minute_band_mid[_YYYY-MM].parquet")
+    ap.add_argument("--band", required=True,
+                    help="*_minute_band.parquet；支持通配，如 'ob/*/binance_futures_minute_band.parquet'")
+    ap.add_argument("--mid", required=True,
+                    help="*_minute_band_mid.parquet；同样支持通配（日包解压后的多个文件）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit-rows", type=int, default=None,
                     help="只读前 N 行做本地冒烟测试；不传则全量")
@@ -354,7 +362,8 @@ def main() -> None:
                     help="确认在本地跑全量（>256MB 的 band）。默认拒绝，避免占满本机")
     args = ap.parse_args()
 
-    band_mb = Path(args.band).stat().st_size / 1e6
+    # band 可能是通配（一个月的日包），体积按所有匹配文件求和
+    band_mb = sum(p.stat().st_size for p in map(Path, glob.glob(args.band))) / 1e6
     if args.limit_rows is None and band_mb > 256 and not args.force:
         raise SystemExit(
             f"band 文件 {band_mb:.0f} MB，全量聚合约 1.5 亿行，会把本机 CPU/内存打满。\n"
@@ -362,7 +371,7 @@ def main() -> None:
             "全量请放到 Kaggle 内核上跑（确认过再 --force）。"
         )
 
-    df = build_l1(Path(args.band), Path(args.mid), limit_rows=args.limit_rows,
+    df = build_l1(args.band, args.mid, limit_rows=args.limit_rows,
                   bin_mode=args.bin_mode)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(args.out)

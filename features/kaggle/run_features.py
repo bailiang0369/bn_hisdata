@@ -6,9 +6,13 @@
   ob-dataset-vol8  : ob_BTCUSDT_{YYYY-MM}.parquet              (L2 滚动后，逐月)
                      ob_BTCUSDT.parquet                        (最终交付：全窗口单文件)
 
+数据源：`data-YYYY-MM` release 的日包（每天一个 zip，内含 futures/spot 的
+band+mid 分钟快照）。这是唯一一手数据——`pipeline.py` 建完快照就删原始小时文件。
+`data-merged` 只是把这些日包 concat 成月文件，同源可替代，因此不再依赖它。
+
 流程：
-  1. 逐月：拉 futures/spot 的 band+mid（~655MB/月） -> ob_features.py 算 L1
-     -> 删 band+mid（控磁盘）。月与月之间 L1 都留在本地（rolling 要跨月）。
+  1. 逐月：拉当月日包并解压 -> ob_features.py 用通配直接读 30 个日 parquet 算 L1
+     -> 删日包（控磁盘）。月与月之间 L1 都留在本地（rolling 要跨月）。
   2. 全月算完：build_ob_dataset.py（全序列 reindex+滚动+校验门禁）-> ob_*.parquet。
   3. 上传 L1 与 ob 数据集；已存在的资产跳过（真正增量）。
 
@@ -23,7 +27,8 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import date
+import zipfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import requests
@@ -106,6 +111,17 @@ def months() -> list[str]:
         m += 1
         if m > 12:
             m, y = 1, y + 1
+    return out
+
+
+def days_of(m: str) -> list[str]:
+    """某月的日期列表（YYYY-MM-DD），裁到 [START, END] 内。"""
+    y, mo = int(m[:4]), int(m[5:])
+    d, out = date(y, mo, 1), []
+    while d.month == mo:
+        if START <= d.isoformat() <= END:
+            out.append(d.isoformat())
+        d += timedelta(days=1)
     return out
 
 
@@ -211,35 +227,53 @@ def main():
     if not os.path.isdir(ROOT / ".git"):
         subprocess.run(["git", "clone", REPO, str(ROOT)], check=True)
 
-    # 1) 逐月 L1（futures + spot），算完删 band+mid
+    # 1) 逐月 L1（futures + spot），直接吃 data-YYYY-MM 的日包
     for m in months():
         done = all((L1 / f"ob_features_{ex}_{m}.parquet").exists() for ex in EXCHANGES)
         if done:
             print(f"[{m}] L1 exists, skip", flush=True)
             continue
+
+        mdir = OB / m
+        days = days_of(m)
+        got, miss = 0, []
+        for d in days:
+            if (mdir / d / "binance_futures_minute_band.parquet").exists():
+                got += 1
+                continue
+            # 一个 zip 同时含 futures/spot 的 band+mid，两个交易所共用
+            zp = download(f"{DL_BASE}/data-{m}/{d}.zip", mdir / f"{d}.zip",
+                          optional=True)
+            if zp is None:
+                miss.append(d)
+                continue
+            with zipfile.ZipFile(zp) as z:
+                z.extractall(mdir / d)
+            zp.unlink(missing_ok=True)
+            got += 1
+        print(f"[{m}] 日包 {got}/{len(days)} 天"
+              + (f"，缺 {len(miss)} 天（{miss[0]}…{miss[-1]}）" if miss else ""),
+              flush=True)
+
         for ex in EXCHANGES:
-            band = OB / f"{ex}_minute_band_{m}.parquet"
-            mid = OB / f"{ex}_minute_band_mid_{m}.parquet"
             out = L1 / f"ob_features_{ex}_{m}.parquet"
             if out.exists():
                 continue
-            # 优先复用 Release 上已算好的 L1（重跑时省掉重新下载 band + 聚合）
+            # 优先复用 Release 上已算好的 L1（重跑时省掉重新下载 + 聚合）
             if download(f"{DL_BASE}/{L1_TAG}/{out.name}", out, optional=True) is not None:
                 print(f"[{m}] reuse cached L1 {ex}", flush=True)
                 continue
-            print(f"[{m}] download {ex} band ...", flush=True)
-            download(f"{DL_BASE}/data-merged/{band.name}", band)
-            download(f"{DL_BASE}/data-merged/{mid.name}", mid)
             print(f"[{m}] compute L1 {ex} ...", flush=True)
-            run("features/ob_features.py", "--band", str(band), "--mid", str(mid),
+            run("features/ob_features.py",
+                "--band", str(mdir / "*" / f"{ex}_minute_band.parquet"),
+                "--mid", str(mdir / "*" / f"{ex}_minute_band_mid.parquet"),
                 "--out", str(out), "--bin-mode", OB_BIN_MODE, "--force")
-            band.unlink(missing_ok=True)
-            mid.unlink(missing_ok=True)
-        # 上传本月的两份 L1（增量），本地保留供 rolling
+        # 上传本月的两份 L1（增量），本地保留供 rolling；日包已用完，删掉控磁盘
         for ex in EXCHANGES:
             print(f"[{m}] upload L1 {ex}", upload(L1_TAG,
                                                   L1 / f"ob_features_{ex}_{m}.parquet"),
                   flush=True)
+        shutil.rmtree(mdir, ignore_errors=True)
 
     # 2) 全序列 rolling + 校验（build_ob_dataset 内部用 glob 展开，不碰 K 线）
     run("features/build_ob_dataset.py",
