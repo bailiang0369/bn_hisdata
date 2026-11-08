@@ -235,6 +235,7 @@ def main():
             continue
 
         mdir = OB / m
+        mdir.mkdir(parents=True, exist_ok=True)
         days = days_of(m)
         got, miss = 0, []
         for d in days:
