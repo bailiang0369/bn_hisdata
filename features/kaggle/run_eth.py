@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Kaggle kernel: 用 bn_hisdata 管线构建 ETHUSDT 订单簿特征，产出可发布为 Kaggle Dataset 的 parquet。
+"""Kaggle kernel: 用 bn_hisdata 管线构建 ETHUSDT **vol8 口径纯盘口**订单簿特征。
 
 为什么单独一个内核：`run_features.py` 依赖 Release 上**预构建好的 BTC band**，
 而 ETH 的 band 在 Release 上不存在，必须从 CryptoHFTData 原始 L2 重新构建。
 
+口径对齐 `ob-dataset-vol8`（BTC 现役基线的数据源）：
+  L1 显式 `--bin-mode vol8`（1/2/4/8σ 振幅自适应分箱，不是历史 b0..b4 固定 bps）；
+  只走 `build_ob_dataset.py` → 185 列纯盘口，**不拼 K 线 OHLC、不拼 ob_kline_cross 跨域列**。
+  旧版产物 `{SYMBOL}.parquet`（207 列 merged 宽表）已废弃，见 bn_bt/融合实验记录.md §23。
+
 MODE（环境变量）：
   probe（默认）: 只精确探测 `{SYMBOL}_orderbook` 键是否存在，打印大小，不下载。
   smoke       : 探测 + 构建 MAX_DAYS 天 band/L1（端到端验证管线与耗时）。
-  build       : 全量构建 band → 月度 → L1 → merged → /kaggle/working/eth_dataset/{SYMBOL}.parquet
+  build       : 全量构建 band → 月度 → L1 → build_ob_dataset
+                → /kaggle/working/eth_dataset/ob_{SYMBOL}.parquet
 
 环境变量：
   MODE=probe|smoke|build    默认 probe
@@ -15,15 +21,17 @@ MODE（环境变量）：
   START / END               日期范围，默认 2025-07-01 / 2026-10-20
   MAX_DAYS=0                smoke 处理天数（默认 2）；build 时为 0 表示全部
 
-需要 CHD_API_KEY（本内核用 --env 注入到私有内核，不入公开仓库）。
+需要 CHD_API_KEY（注入到私有内核，不入公开仓库）。
 
-产物：/kaggle/working/eth_dataset/{SYMBOL}.parquet（内核输出页可 Create Dataset）
-中间产物一律放 /tmp，避免 /kaggle/working 过大导致 `kaggle kernels output` 卡死。
+产物：/kaggle/working/eth_dataset/ob_{SYMBOL}.parquet（185 列，与 BTC ob_BTCUSDT.parquet 同构）
+      /kaggle/working/eth_l1/*.parquet（L1 备份，7h 长任务失败时可免于重跑最贵的 band 段）
+其余中间产物仍在 /tmp，避免 output 过大。
 """
 import os
 import sys
 import json
 import time
+import shutil
 import contextlib
 import subprocess
 from datetime import date, timedelta
@@ -189,16 +197,12 @@ def probe(key: str) -> int:
 def build(key: str, max_days: int) -> int:
     """逐日构建 band → 月度 → L1 → merged → 单文件。中间产物在 /tmp。"""
     base = TMP / "eth"
-    data, vis, monthly, l1, merged = (base / "data", base / "vision",
-                                      base / "monthly", base / "l1", base / "merged")
-    for p in (data, vis, monthly, l1, merged):
+    data, monthly, l1, merged = (base / "data", base / "monthly",
+                                base / "l1", base / "merged")
+    for p in (data, monthly, l1, merged):
         p.mkdir(parents=True, exist_ok=True)
 
-    # 1) vision-base：原始 1m K 线，按自然年发布（每标的每年一个文件）
-    for y in sorted({m[:4] for m in months(START, END)}):
-        n = f"{SYMBOL}_1m_klines_{y}.parquet"
-        download(f"{DL_BASE}/vision-base/{n}", vis / n)
-
+    # vol8 纯盘口不掺 K 线：标签由训练侧 join vision-base 的 close 得到
     env = dict(os.environ, OB_SYMBOL=SYMBOL, CHD_API_KEY=key)
 
     # 2) 逐日构建 band
@@ -261,13 +265,21 @@ def build(key: str, max_days: int) -> int:
             if not band.exists() or not mid.exists() or out.exists():
                 continue
             sh([sys.executable, "features/ob_features.py",
-                "--band", str(band), "--mid", str(mid), "--out", str(out), "--force"],
+                "--band", str(band), "--mid", str(mid), "--out", str(out),
+                "--bin-mode", "vol8", "--force"],
                cwd=str(ROOT), env=env)
     l1_files = sorted(l1.glob("ob_features_*.parquet"))
-    log(f"L1 产物：{len(l1_files)} 个")
+    log(f"L1 产物：{len(l1_files)} 个（vol8）")
+
+    # L1 是整条链最贵的一段（band 从 R2 逐日重建），备份到 output 便于失败后免于重跑
+    l1_out = WORK / "eth_l1"
+    l1_out.mkdir(parents=True, exist_ok=True)
+    for fp in l1_files:
+        shutil.copy2(fp, l1_out / fp.name)
+    log(f"L1 备份 {len(l1_files)} 个 -> {l1_out}")
 
     if max_days:
-        log("smoke 模式：跳过订单簿数据集/跨域拼接，只验证 band+L1 管线")
+        log("smoke 模式：跳过 build_ob_dataset，只验证 band+L1(vol8) 管线")
         return 0 if built and l1_files else 1
 
     # 5) 订单簿特征单独成数据集（不掺 K 线）
@@ -277,28 +289,20 @@ def build(key: str, max_days: int) -> int:
         "--out-dir", str(merged), "--symbol", SYMBOL],
        cwd=str(ROOT), env=env)
 
-    # 5b) 跨域特征（成交 vs 挂单、振幅倍数处的不平衡）单独 join K 线
-    sh([sys.executable, "features/ob_kline_cross.py",
-        "--ob", str(merged / f"ob_{SYMBOL}_2*.parquet"),
-        "--vision", str(vis / f"{SYMBOL}_base_features_*.parquet"),
-        "--out-dir", str(merged), "--symbol", SYMBOL],
-       cwd=str(ROOT), env=env)
-
-    # 6) 拼单文件 → /kaggle/working/eth_dataset/
+    # 6) build_ob_dataset 已产出全窗口单文件（185 列纯盘口），直接抄进 output
+    final = merged / f"ob_{SYMBOL}.parquet"
+    if not final.exists():
+        log("没有全窗口 ob 产物")
+        return 1
     import polars as pl
 
-    files = sorted(merged.glob(f"obx_{SYMBOL}_2*.parquet"))
-    if not files:
-        log("没有 obx 产物")
-        return 1
+    df = pl.read_parquet(final)
     out_dir = WORK / "eth_dataset"
     out_dir.mkdir(parents=True, exist_ok=True)
-    final = out_dir / f"{SYMBOL}.parquet"
-    log(f"concat {len(files)} 个月度文件 -> {final}")
-    df = (pl.concat([pl.scan_parquet(f) for f in files], how="vertical_relaxed")
-          .unique(subset=["close_time"], keep="last").sort("close_time").collect())
-    df.write_parquet(final, compression="zstd")
-    log(f"DONE {final} {df.height:,} 行 x {df.width} 列 {final.stat().st_size / 1e6:.1f} MB")
+    dst = out_dir / final.name
+    shutil.copy2(final, dst)
+    log(f"DONE {dst} {df.height:,} 行 x {df.width} 列 "
+        f"{dst.stat().st_size / 1e6:.1f} MB（vol8 纯盘口，未拼 K 线/跨域）")
     return 0
 
 
