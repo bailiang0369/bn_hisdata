@@ -6,9 +6,12 @@
 
 用法：
     export CHD_API_KEY=your-key
-    python orderbook/test_r2_speed.py 2025-07-01 32 all            # 整日（两交易所各 24h=48 文件）并发
-    python orderbook/test_r2_speed.py 2025-07-01 8 0,1,2,3         # 轻量试水（8 个文件）
-    python orderbook/test_r2_speed.py 2025-07-01 4 0 binance_futures   # 单文件测速
+    python orderbook/bench_r2_speed.py 2025-07-01 32 all            # 整日（两交易所各 24h=48 文件）并发
+    python orderbook/bench_r2_speed.py 2025-07-01 8 0,1,2,3         # 轻量试水（8 个文件）
+    python orderbook/bench_r2_speed.py 2025-07-01 4 0 binance_futures   # 单文件测速
+
+文件名刻意不用 `test_` 前缀：它是**手动测速脚本**，会在 import 阶段读环境变量并
+`sys.exit(2)`，被 pytest 当成测试收集会让整个 `pytest` 会话 INTERNALERROR。
 
 鉴权方式与 download_orderbook_s3.py 完全一致；只测下载吞吐，不做构建。
 """

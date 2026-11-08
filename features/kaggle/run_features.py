@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kaggle kernel: 从 data-merged 拉月度 band/mid，算**订单簿**特征（不含 K 线）。
+"""Kaggle kernel: 从 data-YYYY-MM 日包拉原始 band/mid，算**订单簿**特征（不含 K 线）。
 
 产出（Release，按月可续传；tag 后缀随分箱口径，默认 vol8）：
   ob-features-vol8 : ob_features_{exchange}_{YYYY-MM}.parquet  (L1 截面，逐月中间态)
@@ -9,6 +9,10 @@
 数据源：`data-YYYY-MM` release 的日包（每天一个 zip，内含 futures/spot 的
 band+mid 分钟快照）。这是唯一一手数据——`pipeline.py` 建完快照就删原始小时文件。
 `data-merged` 只是把这些日包 concat 成月文件，同源可替代，因此不再依赖它。
+
+边界月注意：L1 月度资产按名 skip，而 `END` 落在月中时当月 L1 天然是残缺的。
+所以复用缓存前会用 `_l1_covers()` 校验覆盖度；不够就重算并**覆盖**上传，
+把 END 往后延不会丢新数据。
 
 流程：
   1. 逐月：拉当月日包并解压 -> ob_features.py 用通配直接读 30 个日 parquet 算 L1
@@ -28,7 +32,7 @@ import subprocess
 import sys
 import time
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -123,6 +127,28 @@ def days_of(m: str) -> list[str]:
             out.append(d.isoformat())
         d += timedelta(days=1)
     return out
+
+
+def _l1_covers(fp: Path, m: str) -> bool:
+    """本地/缓存的月度 L1 是否覆盖到该月应有的**最后一天**。
+
+    月度 L1 一旦上传就按资产名 skip，但**边界月天然是残缺的**（`END` 落在月中，
+    例如 2026-10 只到 20 日）。之后把 END 往后延，复用旧资产会让新增的那几天
+    整段消失，且流水线看起来完全正常。所以复用前必须按 close_time 覆盖度校验。
+    """
+    days = days_of(m)
+    if not days:
+        return True
+    last = date.fromisoformat(days[-1]) + timedelta(days=1)
+    expect = int(datetime(last.year, last.month, last.day,
+                          tzinfo=timezone.utc).timestamp() * 1000)
+    try:
+        import polars as pl
+        ct = pl.read_parquet(str(fp), columns=["close_time"])["close_time"]
+    except Exception as exc:  # noqa: BLE001 - 读不出来就当缓存不可用
+        print(f"  L1 无法读取（{type(exc).__name__}），重新计算", flush=True)
+        return False
+    return ct.len() > 0 and int(ct.max()) >= expect
 
 
 def download(url: str, dst: Path, optional: bool = False) -> Path | None:
@@ -256,23 +282,37 @@ def main():
               + (f"，缺 {len(miss)} 天（{miss[0]}…{miss[-1]}）" if miss else ""),
               flush=True)
 
+        recomputed: set[str] = set()
         for ex in EXCHANGES:
             out = L1 / f"ob_features_{ex}_{m}.parquet"
+            if out.exists() and not _l1_covers(out, m):
+                print(f"[{m}] 本地 L1 {ex} 覆盖不足 -> 重算", flush=True)
+                out.unlink()
             if out.exists():
                 continue
-            # 优先复用 Release 上已算好的 L1（重跑时省掉重新下载 + 聚合）
+            # 优先复用 Release 上已算好的 L1（重跑时省掉重新下载 + 聚合）。
+            # 但边界月的历史资产可能是按更早的 END 算的，覆盖度不够时必须重算，
+            # 否则新月的数据永远进不来（资产按名 skip，不会自愈）。
             if download(f"{DL_BASE}/{L1_TAG}/{out.name}", out, optional=True) is not None:
-                print(f"[{m}] reuse cached L1 {ex}", flush=True)
-                continue
+                if _l1_covers(out, m):
+                    print(f"[{m}] reuse cached L1 {ex}", flush=True)
+                    continue
+                print(f"[{m}] 缓存的 L1 {ex} 覆盖不足 -> 重算", flush=True)
+                out.unlink()
+                recomputed.add(ex)
+            else:
+                recomputed.add(ex)
             print(f"[{m}] compute L1 {ex} ...", flush=True)
             run("features/ob_features.py",
                 "--band", str(mdir / "*" / f"{ex}_minute_band.parquet"),
                 "--mid", str(mdir / "*" / f"{ex}_minute_band_mid.parquet"),
                 "--out", str(out), "--bin-mode", OB_BIN_MODE, "--force")
         # 上传本月的两份 L1（增量），本地保留供 rolling；日包已用完，删掉控磁盘
+        # 重算过的月份必须覆盖旧资产，否则脚本自己 skip，本地与 Release 长期不一致。
         for ex in EXCHANGES:
-            print(f"[{m}] upload L1 {ex}", upload(L1_TAG,
-                                                  L1 / f"ob_features_{ex}_{m}.parquet"),
+            fp = L1 / f"ob_features_{ex}_{m}.parquet"
+            print(f"[{m}] upload L1 {ex}",
+                  upload_replace(L1_TAG, fp) if ex in recomputed else upload(L1_TAG, fp),
                   flush=True)
         shutil.rmtree(mdir, ignore_errors=True)
 

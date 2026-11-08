@@ -286,13 +286,23 @@ def _pivot_bins(bin_agg: pl.DataFrame, bin_names: tuple[str, ...]) -> pl.DataFra
     missing = [v for v in ren.values() if v not in wide.columns]
     if missing:  # 整月都没有某个箱（极端行情）
         wide = wide.with_columns([pl.lit(None).alias(c) for c in missing])
-    return wide.with_columns([
+    wide = wide.with_columns([
         pl.col(f"ob_q_{s}_{bn}").fill_null(0.0)
         for s in ("bid", "ask") for bn in bin_names
     ] + [
         pl.col(f"ob_n_{s}_{bn}").fill_null(0)
         for s in ("bid", "ask") for bn in bin_names
     ])
+    # 显式定列序：pivot 的列序取决于分组出现的先后（逐日聚合 vs 单文件聚合不同），
+    # 不定序会让同一份数据在不同运行里列序漂移，下游按位置取列就静默错位。
+    order = ["bucket"]
+    for metric in ("q", "n", "vwap"):
+        for s in ("bid", "ask"):
+            for bn in bin_names:
+                order.append({"q": f"ob_q_{s}_{bn}",
+                              "n": f"ob_n_{s}_{bn}",
+                              "vwap": f"ob_vwap_{s}_{bn}_bps"}[metric])
+    return wide.select(order)
 
 
 def build_l1(band_path: str | Path, mid_path: str | Path,

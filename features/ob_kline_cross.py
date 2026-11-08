@@ -50,6 +50,19 @@ def log(msg: str) -> None:
     print(f"[{time.time() - T:7.1f}s] {msg}", flush=True)
 
 
+def _sanitize(df: pl.DataFrame) -> pl.DataFrame:
+    """inf / -inf / NaN 统一置 null（与 ob_features / ob_rolling 同口径）。
+
+    本模块的 `atk_*` 全是除法：主动买+主动卖 = 0、单侧挂单量 = 0、`Qb+Qa` = 0
+    都会造出 inf，而 inf 不参与统计、不触发报错，只会静默污染下游模型。
+    """
+    cols = [c for c in df.columns if df[c].dtype in (pl.Float32, pl.Float64)]
+    return df.with_columns([
+        pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c)
+        for c in cols
+    ])
+
+
 def _ym(col: str = "close_time") -> pl.Expr:
     """毫秒时间戳 -> 'YYYY-MM'（UTC），按 bar 起点归月（与 build_ob_dataset 一致）。
 
@@ -198,6 +211,7 @@ def main() -> None:
 
     df = _amp_features(df) if "amp_mean_30m_bps" in df.columns else df
     df = _atkdef_features(df)
+    df = _sanitize(df)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

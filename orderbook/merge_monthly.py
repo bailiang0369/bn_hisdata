@@ -71,9 +71,34 @@ def _merge(files, out: Path) -> None:
             n_legacy += 1
         parts.append(lf)
     lf = pl.concat(parts, how="vertical_relaxed")
-    lf.sink_parquet(str(out))
+    # 先写 .part 再原子改名：续跑判定以"月份文件存在"为准，半截文件会被永久跳过。
+    tmp = out.with_name(out.name + ".part")
+    try:
+        lf.sink_parquet(str(tmp))
+        tmp.replace(out)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     if n_legacy:
         print(f"  note: {n_legacy}/{len(files)} 个每日文件为遗留无序产物，已单独排序并入")
+
+
+def _rows(path: Path) -> int:
+    """parquet 行数（读 footer 元数据，不扫数据）。"""
+    return int(pl.scan_parquet(path).select(pl.len()).collect().item())
+
+
+def _stale(out: Path, files) -> bool:
+    """月份文件是否落后于每日文件。
+
+    只判"文件存在"会漏掉**回补场景**：先合并了 6 月前半月，之后再补下半月，
+    第二次运行会因为月表已存在直接 skip，新数据永远进不去。用行数总和比对
+    （元数据级，成本可忽略）能精确发现"每日文件比月表多"。
+    """
+    try:
+        return _rows(out) != sum(_rows(f) for f in files)
+    except Exception:  # noqa: BLE001 - 旧文件损坏时宁可重建
+        return True
 
 
 def main() -> None:
@@ -106,18 +131,22 @@ def main() -> None:
         for ym, (b_files, m_files) in sorted(groups.items()):
             band_out = out_dir / f"{exchange}_minute_band_{ym}.parquet"
             mid_out = out_dir / f"{exchange}_minute_band_mid_{ym}.parquet"
-            rebuild = args.force or (not band_out.exists()) or (not mid_out.exists())
-            if not rebuild:
-                print(f"[skip] {exchange} {ym}: 月份文件已存在")
+            # 逐文件独立判断：只要每日文件比月表多（回补过几天），就重建。
+            need_band = bool(b_files) and (
+                args.force or not band_out.exists() or _stale(band_out, (f for _, f in b_files)))
+            need_mid = bool(m_files) and (
+                args.force or not mid_out.exists() or _stale(mid_out, (f for _, f in m_files)))
+            if not (need_band or need_mid):
+                print(f"[skip] {exchange} {ym}: 月份文件已存在且不落后于每日文件")
                 continue
-            if b_files and (args.force or not band_out.exists()):
+            if need_band:
                 _merge(b_files, band_out)
                 print(f"[ok]   {exchange} {ym} band: {len(b_files)} 天 -> {band_out.name} "
                       f"({band_out.stat().st_size:,} B)")
                 if args.delete_daily:
                     for f in b_files:
                         f.unlink(missing_ok=True)
-            if m_files and (args.force or not mid_out.exists()):
+            if need_mid:
                 _merge(m_files, mid_out)
                 print(f"[ok]   {exchange} {ym} mid : {len(m_files)} 天 -> {mid_out.name} "
                       f"({mid_out.stat().st_size:,} B)")

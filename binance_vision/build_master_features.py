@@ -122,6 +122,10 @@ def _join_agg_features(master_lf: pl.LazyFrame, df_agg, prefix: str,
     missing = [c for c in FEATURE_COLS if c not in prepared.collect_schema().names()]
     if missing:
         raise ValueError(f"aggTrades feature columns missing after prepare: {missing}")
+    # daily 与 monthly 目录可能覆盖同一段时间（下载器的两条粒度可并存）。
+    # klines 侧已在 185 行做了 unique，agg 侧若漏做，left join 会把 master 行数翻倍
+    # （原始路径更糟：同一分钟的逐笔被重复聚合，rv/dt_mean 全算错且不报错）。
+    prepared = prepared.unique(subset=["close_time"], keep="first")
     prepared = prepared.rename({c: f"{prefix}{c}" for c in FEATURE_COLS})
     return master_lf.join(prepared, on="close_time", how="left")
 
@@ -142,7 +146,7 @@ def build_master_feature_table_lazy(
     # close_time 归一化到 ms（防御 µs epoch 的文件；下载器输出的已是 ms，这里是 no-op）
     lf_um_prep = lf_um.with_columns(
         pl.when(pl.col("close_time") > 1e14)
-        .then(pl.col("close_time") // 1000)
+        .then(pl.col("close_time") // 1000 + 1)   # µs 原始值是 bar 结束 -1ms
         .otherwise(pl.col("close_time"))
         .alias("close_time")
     ).select(
@@ -161,7 +165,7 @@ def build_master_feature_table_lazy(
     # 2. Spot Klines (Spot OHLC + Volume)
     lf_spot_prep = lf_spot.with_columns(
         pl.when(pl.col("close_time") > 1e14)
-        .then(pl.col("close_time") // 1000)
+        .then(pl.col("close_time") // 1000 + 1)   # 同上：µs -> 下一分钟起点
         .otherwise(pl.col("close_time"))
         .alias("close_time")
     ).select(

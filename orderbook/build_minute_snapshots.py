@@ -116,12 +116,19 @@ def main() -> None:
     # sparse/dense 只是计算时的内存策略，产物（band+mid）schema 与内容一致，
     # 因此统一写成 {exchange}_minute_band.parquet，与 pipeline / merge_monthly 对齐，
     # 避免 sparse 产物因多带 _sparse 后缀而不被识别、无法续跑/聚合。
-    out = args.out or str(
-        Path(args.dest_root) / args.date / f"{args.exchange}_minute_band.parquet"
-    )
-    band_all.write_parquet(out)
-    mid_all.write_parquet(out.replace(".parquet", "_mid.parquet"))
-    log(f"wrote {out} and *_mid.parquet")
+    out = Path(args.out or
+               str(Path(args.dest_root) / args.date
+                   / f"{args.exchange}_minute_band.parquet"))
+    # mid 路径用 with_name 推导，不能对字符串做 .replace(".parquet", ...)：
+    # --out 不以 .parquet 结尾时替换是空操作，mid 会覆盖掉 band，且不报错。
+    mid_out = out.with_name(out.stem + "_mid" + out.suffix)
+    # 先写 .part 再原子改名：pipeline 的 _all_built 以"文件存在"判定完成，
+    # 半截 parquet 会被当成已构建，之后永远不再重建。
+    for df, dst in ((band_all, out), (mid_all, mid_out)):
+        tmp = dst.with_name(dst.name + ".part")
+        df.write_parquet(tmp)
+        tmp.replace(dst)
+    log(f"wrote {out} and {mid_out}")
 
     # sanity preview
     with pl.Config(tbl_rows=5, tbl_cols=10):

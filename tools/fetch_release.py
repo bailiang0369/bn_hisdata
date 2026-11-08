@@ -8,11 +8,14 @@
     # 只要 BTCUSDT
     python tools/fetch_release.py --tag vision-base --pattern 'BTCUSDT_*' --dest ./data/vision
 
-    # 订单簿分钟汇总（对齐最常用），两个交易所
+    # 订单簿特征（185 列，close_time 主键，直接 join K 线）
+    python tools/fetch_release.py --tag ob-dataset-vol8 --pattern 'ob_BTCUSDT.parquet' --dest ./data/ob
+
+    # 订单簿原始分钟汇总（自己算盘口特征时才用），两个交易所
     python tools/fetch_release.py --tag data-merged --pattern '*minute_band_mid_*' --dest ./data/ob
 
     # 先看有什么，不下载
-    python tools/fetch_release.py --tag data-merged --list
+    python tools/fetch_release.py --tag ob-dataset-vol8 --list
 
 设计:
   * 仓库 public，**不需要 token**；设了 `GH_TOKEN` 就带上，仅用于抬高 API 限额。
@@ -85,6 +88,14 @@ def download(asset: dict, dest_dir: Path) -> tuple[str, str, int]:
 
     tmp = dst.with_suffix(dst.suffix + ".part")
     start = tmp.stat().st_size if tmp.exists() else 0
+    if start == size:
+        # 上次已经下满、只是改名失败（Windows 上被 AV/索引占用很常见）。
+        # 此时再发 `Range: bytes=<size>-` 会被判 416，每次都崩在同一资产上。
+        tmp.replace(dst)
+        return name, "ok", size
+    if start > size:
+        tmp.unlink()                 # 资产被重新上传且更小，残件已无意义
+        start = 0
     headers = {"Range": f"bytes={start}-"} if start else None
     with requests.get(asset["browser_download_url"], stream=True,
                       timeout=300, headers=headers) as r:
@@ -93,7 +104,7 @@ def download(asset: dict, dest_dir: Path) -> tuple[str, str, int]:
         elif r.status_code in (200, 206):
             mode, base = "wb", 0
         else:
-            r.raise_for_status()
+            # 不 raise：单个资产失败不该中断其余资产（main 里按 fail 计数收口）
             return name, f"HTTP{r.status_code}", start
         total = base + int(r.headers.get("Content-Length", 0))
         done, tick = base, base
@@ -115,7 +126,9 @@ def download(asset: dict, dest_dir: Path) -> tuple[str, str, int]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="从 bn_hisdata 的 GitHub Release 拉取 parquet")
-    ap.add_argument("--tag", required=True, help="release tag: vision-base | data-merged | data-YYYY-MM")
+    ap.add_argument("--tag", required=True,
+                    help="release tag: vision-base | ob-dataset-vol8 | ob-features-vol8 | "
+                         "data-merged | data-YYYY-MM（其余 tag 也能拉，不做白名单）")
     ap.add_argument("--pattern", default="*", help="资产名通配符，默认全部（fnmatch 语法）")
     ap.add_argument("--dest", help="下载目录（--list 时可省略）")
     ap.add_argument("--list", action="store_true", help="只列出匹配的资产，不下载")

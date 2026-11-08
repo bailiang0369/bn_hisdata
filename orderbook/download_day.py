@@ -135,7 +135,11 @@ def main() -> int:
                     data = zstd.ZstdDecompressor().stream_reader(io.BytesIO(data)).read()
                 dest = dest_dir / f"{SYMBOL}_{DATA_TYPE}.parquet"
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(data)
+                # 先写 .part 再原子改名：上面「文件存在即跳过」是以文件名判定的，
+                # 半截文件会被当成已下载，导致 build 每次都失败且永不再下。
+                tmp = dest.with_suffix(".parquet.part")
+                tmp.write_bytes(data)
+                tmp.replace(dest)
                 got = len(data)
                 break
         except Exception as exc:  # noqa: BLE001 - 单小时失败不中断其余小时（与 R2 路径一致）
@@ -158,7 +162,10 @@ def main() -> int:
     total = sum(f.stat().st_size for f in root.rglob("*") if f.is_file())
     print(f"\nDone {args.date} {args.exchange}: {ok} files, {miss} missing, "
           f"{err} errored, total {total:,} bytes")
-    return 1 if err else 0
+    # miss（源端缺小时）也必须非零：返回 0 会让 pipeline 认为下载成功，
+    # 用残缺的小时集 build 出整天 band，再 cleanup 删原始文件——之后
+    # `_all_built` 永远为真，缺失的小时再也不会重试。
+    return 1 if (err or miss) else 0
 
 
 if __name__ == "__main__":

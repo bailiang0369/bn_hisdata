@@ -307,7 +307,10 @@ def main() -> int:
     dt = time.time() - t0
     print(f"\nDone in {dt:.1f}s: {ok} downloaded, {skip} present, {miss} missing, "
           f"{abort} aborted(day-missing), {err} errored for {date}")
-    if err:
+    # miss/abort 都表示"当天小时不全"。返回 0 会让 pipeline 用残缺的小时集
+    # build 出整天 band 并 cleanup 删原始文件，此后 `_all_built` 永远为真，
+    # 缺失的小时再也不会补——宁可让上层标记失败、下一轮重试。
+    if err or miss or abort:
         return 1
     return 0
 

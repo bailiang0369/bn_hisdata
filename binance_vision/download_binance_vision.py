@@ -371,8 +371,9 @@ def process(zip_path: Path, category: str, fmt: str, fdtype, log) -> None:
         with zipfile.ZipFile(zip_path) as z:
             csv_in = [n for n in z.namelist() if n.endswith(".csv")]
             if not csv_in:
-                log("no csv inside zip")
-                return
+                # 必须抛：静默 return 会被 handle_task 计为 ok 并删掉源 zip，
+                # 结果是"汇总全绿但输出文件根本不存在"。抛出让外层重下一次再判失败。
+                raise ValueError(f"zip 内没有 .csv（{zip_path.name}）")
             with z.open(csv_in[0]) as src, tmp_csv.open("wb") as dst:
                 while True:
                     chunk = src.read(1 << 20)
@@ -382,8 +383,8 @@ def process(zip_path: Path, category: str, fmt: str, fdtype, log) -> None:
         with tmp_csv.open("rb") as fh:
             first = fh.readline().decode("utf-8", errors="replace")
             if not first.strip():
-                log("empty csv inside zip")
-                return
+                # 同上：空 zip 不能算成功，否则输出文件缺失但不报错。
+                raise ValueError(f"zip 内 csv 为空（{zip_path.name}）")
             # Detect header by the first token (a header's first col name is text;
             # a data row's first field is a timestamp/number).
             exp = EXPECTED_FIRST.get(category)
