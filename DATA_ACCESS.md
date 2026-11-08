@@ -350,7 +350,8 @@ assert k.select(pl.col("bucket").diff().drop_nulls().max()).collect().item() == 
 | `vision-base` | `binance_vision/pipeline_daily.py`（每日，`.github/workflows/vision-daily.yml`）<br>`binance_vision/kaggle/vision_run.py`<br>`binance_vision/run_base_table_cloud.sh` | 日常：`update` 补 UTC 昨天 → 并入**当年**年度 parquet → 覆盖发布（历史年份不重写）；首次/补洞：`backfill --start ... ` 按年聚合后每年上传一次 |
 | `data-YYYY-MM` | `orderbook/kaggle/run_orderbook.py` | 逐天 `pipeline.py` → 打包 `{date}.zip` 上传，支持断点续传 |
 | `data-merged` | `orderbook/kaggle_merge/merge_run.py` | 拉每日 zip → `merge_monthly.py` → 传 `data-merged` |
-| `ob-features`<br>`merged-features` | `features/kaggle/run_features.py` | 拉 vision-base + data-merged → `ob_features.py` 算 L1 → `build_dataset.py` 合并 → 传 `ob-features`（逐月 L1）与 `merged-features`（逐月 + 单文件 `BTCUSDT.parquet`） |
+| `ob-features-{mode}`<br>`ob-dataset-{mode}` | `features/kaggle/run_features.py` | 拉 data-merged → `ob_features.py` 算 L1 → `build_ob_dataset.py` 滚动成订单簿数据集（**不含 K 线**）→ 传 L1 与 `ob_BTCUSDT_{m}.parquet` + 单文件 `ob_BTCUSDT.parquet`。跨域特征（成交 vs 挂单）用 `features/ob_kline_cross.py` 单独 join K 线，在 bn_bt 侧或单独跑 |
+| ~~`merged-features`~~ | （历史）`features/build_dataset.py` | 已拆分为上面两段：订单簿数据集 + 跨域特征。<br>该 Release 是旧的「订单簿 + K 线」合并宽表，仅保留给现有 bn_bt 模型消费 |
 
 - 凭据一律走环境变量或 Kaggle Secrets（`GH_TOKEN` / `CHD_API_KEY` / `KAGGLE_USERNAME` /
   `KAGGLE_KEY`），**代码里不留密钥**（仓库是 public）。

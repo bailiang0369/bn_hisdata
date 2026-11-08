@@ -33,11 +33,18 @@
 
 ```
 data-merged 月度 band+mid ──> ob_features.py ──> L1 截面 (ob_*)
-                                                    │ 全窗口拼接 -> reindex -> 滚动
-vision-base 月度宽表 ────────────────────────> build_dataset.py ──> merged_BTCUSDT_{m}.parquet
-                                                    │ 振幅中位数 + 振幅倍数不平衡
-                                                    └ 校验门禁
+                                                     │ 全窗口拼接 -> reindex -> 滚动 -> 校验
+                                                     ▼
+                                        build_ob_dataset.py ──> ob_BTCUSDT_{m}.parquet
+                                                                ob_BTCUSDT.parquet（全窗口）
+
+vision-base K 线 ────────────────────────────> ob_kline_cross.py ──> atk_* / ob_amp_obi_*
+                                              （订单簿 × 成交量的跨域特征，显式 join）
 ```
+
+订单簿特征**不掺 K 线**：盘口侧只依赖自身（futures + spot 互比），K 线更新滞后
+不会阻塞它。只有 `atk_*`（成交 vs 挂单）和 `ob_amp_obi_*`（振幅倍数处的不平衡）
+必须两边对齐，单独放在 `ob_kline_cross.py`，键仍是 `close_time`。
 
 - **主键 `close_time`**：Int64 毫秒 UTC，与 vision-base 完全同键。
   订单簿原始 `bucket`（分钟起点）在 `ob_features.py` 内转成 `close_time = bucket + 60000`。
@@ -184,8 +191,8 @@ vision-base 月度宽表 ──────────────────�
 
 ## 7. 缺失值与缺分钟策略
 
-- 缺分钟（源端断流 / 单边有量）**在特征层不补**：`build_dataset` reindex 到 vision 的
-  完整分钟网格，缺失分钟的 `ob_*` 全 null，并打 `ob_missing=1`。
+- 缺分钟（源端断流 / 单边有量）**在特征层不补**：`build_ob_dataset` reindex 到
+  连续分钟网格（首末时间戳之间），缺失分钟的 `ob_*` 全 null，并打 `ob_missing=1`。
 - 滚动窗口按时间滑过缺口（缺口分钟不参与 agg），所以滚动特征在缺口后仍有效。
 - 单边分钟（只有 bid 或只有 ask）同样产出 null + `ob_missing=1`。
 - **统一去 null 放在建模前**（下游职责）：训练时 drop 掉含 `ob_missing=1` 或关键特征

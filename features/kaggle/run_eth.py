@@ -267,23 +267,29 @@ def build(key: str, max_days: int) -> int:
     log(f"L1 产物：{len(l1_files)} 个")
 
     if max_days:
-        log("smoke 模式：跳过 build_dataset/拼接，只验证 band+L1 管线")
+        log("smoke 模式：跳过订单簿数据集/跨域拼接，只验证 band+L1 管线")
         return 0 if built and l1_files else 1
 
-    # 5) 合并 vision + L1
-    sh([sys.executable, "features/build_dataset.py",
-        "--vision", str(vis / f"{SYMBOL}_base_features_*.parquet"),
+    # 5) 订单簿特征单独成数据集（不掺 K 线）
+    sh([sys.executable, "features/build_ob_dataset.py",
         "--fut", str(l1 / "ob_features_binance_futures_*.parquet"),
         "--spot", str(l1 / "ob_features_binance_spot_*.parquet"),
+        "--out-dir", str(merged), "--symbol", SYMBOL],
+       cwd=str(ROOT), env=env)
+
+    # 5b) 跨域特征（成交 vs 挂单、振幅倍数处的不平衡）单独 join K 线
+    sh([sys.executable, "features/ob_kline_cross.py",
+        "--ob", str(merged / f"ob_{SYMBOL}_2*.parquet"),
+        "--vision", str(vis / f"{SYMBOL}_base_features_*.parquet"),
         "--out-dir", str(merged), "--symbol", SYMBOL],
        cwd=str(ROOT), env=env)
 
     # 6) 拼单文件 → /kaggle/working/eth_dataset/
     import polars as pl
 
-    files = sorted(merged.glob("merged_*.parquet"))
+    files = sorted(merged.glob(f"obx_{SYMBOL}_2*.parquet"))
     if not files:
-        log("没有 merged 产物")
+        log("没有 obx 产物")
         return 1
     out_dir = WORK / "eth_dataset"
     out_dir.mkdir(parents=True, exist_ok=True)

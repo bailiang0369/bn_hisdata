@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Kaggle kernel: 从 data-merged / vision-base 拉月度文件，算订单簿特征并合并。
+"""Kaggle kernel: 从 data-merged 拉月度 band/mid，算**订单簿**特征（不含 K 线）。
 
 产出（Release，按月可续传；tag 后缀随分箱口径，默认 vol8）：
-  ob-features-vol8     : ob_features_{exchange}_{YYYY-MM}.parquet  (L1 截面，逐月中间态)
-  merged-features-vol8 : merged_BTCUSDT_{YYYY-MM}.parquet          (逐月中间态)
-                         BTCUSDT.parquet                           (最终交付：全窗口单文件)
+  ob-features-vol8 : ob_features_{exchange}_{YYYY-MM}.parquet  (L1 截面，逐月中间态)
+  ob-dataset-vol8  : ob_BTCUSDT_{YYYY-MM}.parquet              (L2 滚动后，逐月)
+                     ob_BTCUSDT.parquet                        (最终交付：全窗口单文件)
 
 流程：
-  1. 拉全部 vision-base（BTCUSDT，54MB），小。
-  2. 逐月：拉 futures/spot 的 band+mid（~655MB/月） -> ob_features.py 算 L1
+  1. 逐月：拉 futures/spot 的 band+mid（~655MB/月） -> ob_features.py 算 L1
      -> 删 band+mid（控磁盘）。月与月之间 L1 都留在本地（rolling 要跨月）。
-  3. 全月算完：build_dataset.py（全序列 reindex+滚动+合并 vision+校验门禁）
-     -> merged_BTCUSDT_{YYYY-MM}.parquet。
-  4. 上传 ob-features-vol8 / merged-features-vol8；已存在的资产跳过（真正增量）。
+  2. 全月算完：build_ob_dataset.py（全序列 reindex+滚动+校验门禁）-> ob_*.parquet。
+  3. 上传 L1 与 ob 数据集；已存在的资产跳过（真正增量）。
+
+K 线不在这条链路里：基础 K 线特征由 vision / bn_bt 单独算，跨域特征
+（成交 vs 挂单、振幅倍数处的不平衡）见 features/ob_kline_cross.py。
 
 安全：本文件**不含密钥**，GH_TOKEN 走 env / Kaggle Secrets（见 _secret）。
 断点续传：上传成功的月份资产下次运行直接跳过；band 下载用 HTTP Range 续传。
 """
 import os
-import re
 import subprocess
 import sys
 import time
@@ -29,8 +29,6 @@ import requests
 
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "polars", "zstandard"],
                check=True)
-
-import polars as pl  # noqa: E402 - 必须在 pip install 之后 import
 
 REPO = "https://github.com/bailiang0369/bn_hisdata.git"
 GH_REPO = "bailiang0369/bn_hisdata"
@@ -43,19 +41,18 @@ END = os.environ.get("END", "2026-10-20")
 # 标的可用环境变量覆盖（VISION_SYMBOL）；默认 BTCUSDT，保持既有行为不变。
 SYMBOL = os.environ.get("VISION_SYMBOL", "BTCUSDT")
 EXCHANGES = ("binance_futures", "binance_spot")
-# 分箱口径。vol8 与 bps 的 L1/merged 不可混用，所以 release tag 跟着口径走：
+# 分箱口径。vol8 与 bps 的 L1 不可混用，所以 release tag 跟着口径走：
 # 换口径 = 新 tag = 不复用旧 L1，也不会把新文件 skip 掉。
 OB_BIN_MODE = os.environ.get("OB_BIN_MODE", "vol8")
 L1_TAG = f"ob-features-{OB_BIN_MODE}"
-MERGED_TAG = f"merged-features-{OB_BIN_MODE}"
+DS_TAG = f"ob-dataset-{OB_BIN_MODE}"
 
 WORK = Path("/kaggle/working")
 ROOT = WORK / "bn_hisdata"
 OB = WORK / "ob"
-VIS = WORK / "vision"
 L1 = WORK / "l1"
-MERGED = WORK / "merged"
-for p in (OB, VIS, L1, MERGED):
+DS = WORK / "ob_dataset"
+for p in (OB, L1, DS):
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -209,12 +206,7 @@ def main():
     if not os.path.isdir(ROOT / ".git"):
         subprocess.run(["git", "clone", REPO, str(ROOT)], check=True)
 
-    # 1) vision-base：原始 1m K 线，按自然年发布（每标的每年一个文件）
-    for y in sorted({m[:4] for m in months()}):
-        n = f"{SYMBOL}_1m_klines_{y}.parquet"
-        download(f"{DL_BASE}/vision-base/{n}", VIS / n)
-
-    # 2) 逐月 L1（futures + spot），算完删 band+mid
+    # 1) 逐月 L1（futures + spot），算完删 band+mid
     for m in months():
         done = all((L1 / f"ob_features_{ex}_{m}.parquet").exists() for ex in EXCHANGES)
         if done:
@@ -244,38 +236,28 @@ def main():
                                                   L1 / f"ob_features_{ex}_{m}.parquet"),
                   flush=True)
 
-    # 3) 全序列 rolling + 合并 + 校验（build_dataset 内部用 glob 展开）
-    run("features/build_dataset.py",
-        "--vision", str(VIS / f"{SYMBOL}_1m_klines_*.parquet"),
+    # 2) 全序列 rolling + 校验（build_ob_dataset 内部用 glob 展开，不碰 K 线）
+    run("features/build_ob_dataset.py",
         "--fut", str(L1 / "ob_features_binance_futures_*.parquet"),
         "--spot", str(L1 / "ob_features_binance_spot_*.parquet"),
-        "--out-dir", str(MERGED))
+        "--out-dir", str(DS), "--symbol", SYMBOL)
 
-    # 4) 上传逐月 merged（增量中间态，供单月消费/断点续传）
-    for fp in sorted(MERGED.glob("merged_*.parquet")):
-        print(f"upload {fp.name}", upload(MERGED_TAG, fp), flush=True)
+    # 3) 上传逐月 ob 数据集（增量中间态，供单月消费/断点续传）
+    for fp in sorted(DS.glob(f"ob_{SYMBOL}_2*.parquet")):
+        print(f"upload {fp.name}", upload(DS_TAG, fp), flush=True)
 
-    # 5) 合并成单个 {SYMBOL}.parquet（最终交付）并覆盖上传
-    final = WORK / f"{SYMBOL}.parquet"
-    merged_files = sorted(MERGED.glob("merged_*.parquet"))
-    if not merged_files:
-        raise SystemExit("no merged_*.parquet to concat")
-    print(f"concat {len(merged_files)} merged months -> {final.name} ...", flush=True)
-    df = (
-        pl.concat([pl.scan_parquet(f) for f in merged_files], how="vertical_relaxed")
-        .unique(subset=["close_time"], keep="last")
-        .sort("close_time")
-        .collect()
-    )
-    df.write_parquet(final, compression="zstd")
-    print(f"final: {final.name} {df.height:,} rows x {df.width} cols "
-          f"{final.stat().st_size / 1e6:.1f} MB", flush=True)
-    print(f"upload {final.name}", upload_replace(MERGED_TAG, final), flush=True)
-    # 清理中间目录，让 Kaggle output 只保留最终产物（merged + BTCUSDT.parquet）
+    # 4) 全窗口单文件（build_ob_dataset 已产出）覆盖上传
+    final = DS / f"ob_{SYMBOL}.parquet"
+    if not final.exists():
+        raise SystemExit(f"缺少全窗口文件 {final}")
+    print(f"final: {final.name} {final.stat().st_size / 1e6:.1f} MB", flush=True)
+    print(f"upload {final.name}", upload_replace(DS_TAG, final), flush=True)
+
+    # 清理中间目录，让 Kaggle output 只保留最终产物
     import shutil
-    for d in (L1, OB, VIS):
+    for d in (L1, OB):
         shutil.rmtree(d, ignore_errors=True)
-    print(f"产物: {MERGED}/*.parquet + {final}", flush=True)
+    print(f"产物: {DS}/*.parquet", flush=True)
     print("FEATURES DONE", flush=True)
 
 
