@@ -12,4 +12,5 @@ __pycache__/
 
 # Project data
 .codebuddy/
-kk/
+# kk（kaggle-runner）本地缓存：产物 + 嵌套克隆，不进仓库
+.kk/
