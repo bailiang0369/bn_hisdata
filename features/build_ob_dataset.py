@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import re
 import time
 from pathlib import Path
 
@@ -47,6 +48,7 @@ import polars as pl
 from ob_rolling import build_l2, _reindex
 
 T = time.time()
+MONTH_RE = re.compile(r"(\d{4}-\d{2})")
 
 
 def log(msg: str) -> None:
@@ -62,6 +64,21 @@ def _ym(col: str = "close_time") -> pl.Expr:
     把它还原到该分钟所属的月份。
     """
     return pl.from_epoch(pl.col(col) - 1, time_unit="ms").dt.strftime("%Y-%m")
+
+
+def _months_from_files(files: list[str]) -> list[str]:
+    """从 L1 文件名取月份。
+
+    不能从行时间戳取：月度 L1 在边界重叠（每月文件都含上月最后一分钟，
+    作为滚动 warmup），按行取会多出一个只有 1 行的月份文件。
+    """
+    out: set[str] = set()
+    for f in files:
+        m = MONTH_RE.search(Path(f).name)
+        if not m:
+            raise SystemExit(f"L1 文件名里没有 YYYY-MM: {f}")
+        out.add(m.group(1))
+    return sorted(out)
 
 
 def _prefix(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
@@ -96,7 +113,7 @@ def load_rolled(l1_glob: str, prefix: str) -> tuple[pl.DataFrame, list[str]]:
     # 月度 L1 在边界重叠（每月文件含上月最后一分钟），按 close_time 去重
     raw = raw.unique(subset=["close_time"], keep="last")
 
-    months = sorted(set(raw.select(_ym().alias("ym"))["ym"].unique().to_list()))
+    months = _months_from_files(files)
     df = _reindex(raw)
     log(f"{prefix} after reindex: {df.height:,} rows, missing={df['ob_missing'].sum():,}")
     df = build_l2(df)
