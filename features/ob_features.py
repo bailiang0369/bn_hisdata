@@ -55,7 +55,9 @@ from __future__ import annotations
 
 import argparse
 import glob
+import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
@@ -77,6 +79,7 @@ DEFAULT_BIN_MODE = "vol8"                    # 生产口径：波动率倍数（
 BIN_EDGES, BIN_NAMES = BIN_MODES[DEFAULT_BIN_MODE]
 SIGMA_WINDOW = 30        # 波动尺度：过去 N 个 1 分钟对数收益的标准差
 SIGMA_FLOOR = 0.5        # sigma 下限（bps），防除零与极端放大
+DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")   # 日包解压目录名
 T = time.time()
 
 
@@ -129,17 +132,17 @@ def _sigma_from_mid(mid: pl.DataFrame, window: int = SIGMA_WINDOW) -> pl.DataFra
 
 def _prepare(band: pl.LazyFrame, edges: tuple[float, ...],
              sigma: pl.DataFrame | None) -> pl.LazyFrame:
-    """去重 + 逐行派生 sc / d(bps) / 分箱尺度 / bin / key。
+    """逐行派生 sc / d(bps) / 分箱尺度 / bin / key。
+
+    去重不在这里做：调用方按文件先 `unique` 再喂进来（见 `_scan_band`），
+    否则整月 1.5 亿行一次性去重会把内核内存打爆（Kaggle 上 SIGKILL 过）。
 
     sigma 为 None 时按固定 bps 分箱；否则先用 `d/σ` 归一化再按倍数切桶。
     """
-    lf = (
-        band.unique(subset=["bucket", "side", "px"], keep="any")
-        .with_columns(
-            pl.when(pl.col("side") == "ask").then(1).otherwise(0)
-            .cast(pl.Int8).alias("sc"),
-            (((pl.col("px") - pl.col("mid")) / pl.col("mid")) * 1e4).abs().alias("d_bps"),
-        )
+    lf = band.with_columns(
+        pl.when(pl.col("side") == "ask").then(1).otherwise(0)
+        .cast(pl.Int8).alias("sc"),
+        (((pl.col("px") - pl.col("mid")) / pl.col("mid")) * 1e4).abs().alias("d_bps"),
     )
     if sigma is not None:
         lf = lf.join(sigma.lazy(), on="bucket", how="left").with_columns(
@@ -154,19 +157,20 @@ def _prepare(band: pl.LazyFrame, edges: tuple[float, ...],
     )
 
 
-def _bin_agg(band: pl.LazyFrame, edges: tuple[float, ...],
-             sigma: pl.DataFrame | None) -> pl.DataFrame:
-    """唯一的重活：150M 行 -> ~430K 行。流式引擎优先，不支持时退回内存引擎。"""
-    agg = _prepare(band, edges, sigma).group_by(["bucket", "key"]).agg(
-        pl.col("q").sum().alias("q_sum"),
-        pl.len().cast(pl.Int32).alias("n"),
-        (pl.col("q") * pl.col("px")).sum().alias("qx"),
-        pl.col("q").max().alias("q_max"),
-        (pl.col("q") ** 2).sum().alias("q2"),
-        # 距离用 bps（人看得懂），不用归一化后的无量纲值
-        pl.col("d_bps").sort_by(pl.col("q"), descending=True).first().alias("d_at_maxq"),
-        pl.col("mid").first().alias("mid"),
-    )
+_AGG = [
+    pl.col("q").sum().alias("q_sum"),
+    pl.len().cast(pl.Int32).alias("n"),
+    (pl.col("q") * pl.col("px")).sum().alias("qx"),
+    pl.col("q").max().alias("q_max"),
+    (pl.col("q") ** 2).sum().alias("q2"),
+    # 距离用 bps（人看得懂），不用归一化后的无量纲值
+    pl.col("d_bps").sort_by(pl.col("q"), descending=True).first().alias("d_at_maxq"),
+    pl.col("mid").first().alias("mid"),
+]
+
+
+def _collect(agg: pl.LazyFrame) -> pl.DataFrame:
+    """流式引擎优先，不支持时退回内存引擎。"""
     last = None
     for engine in ("streaming", "in-memory"):
         try:
@@ -175,6 +179,63 @@ def _bin_agg(band: pl.LazyFrame, edges: tuple[float, ...],
             last = exc
             log(f"collect(engine={engine}) failed: {type(exc).__name__}")
     raise SystemExit(f"cannot collect bin aggregation: {last}")
+
+
+def _scan_band(files: list[str]) -> list[pl.LazyFrame]:
+    """每个日 parquet 一条 lazy 管线：切出「自己那一天」并去掉重复档位。
+
+    两件事都在**文件级**做，因为整月一次性去重（1.5 亿行 hash set）会把内核
+    内存打爆——Kaggle 上跑 2025-08 时被 SIGKILL 过。
+
+    1. 日包开头带前一天最后一分钟（warmup），相邻两个文件各存一份：
+       目录名是日期时按 [D 00:00, D+1 00:00) 切，彻底消除跨文件重复。
+    2. 文件内部也有重复（源端每小时文件在 :59 重叠），按 (bucket, side, px) 去重。
+    """
+    out = []
+    for f in files:
+        lf = pl.scan_parquet(f)
+        day = Path(f).parent.name
+        if DATE_DIR.match(day):
+            t0 = int(datetime.fromisoformat(day).replace(
+                tzinfo=timezone.utc).timestamp()) * 1000
+            lf = lf.filter((pl.col("bucket") >= t0) & (pl.col("bucket") < t0 + 86_400_000))
+        out.append(lf.unique(subset=["bucket", "side", "px"], keep="any"))
+    return out
+
+
+# 跨日合并：加和量、取最大单档，并用「q_max 最大的那一份」决定 d_at_maxq
+_MERGE = [
+    pl.col("q_sum").sum(),
+    pl.col("n").sum(),
+    pl.col("qx").sum(),
+    pl.col("q_max").max(),
+    pl.col("q2").sum(),
+    pl.col("d_at_maxq").sort_by(pl.col("q_max"), descending=True).first(),
+    pl.col("mid").first(),
+]
+
+
+def _bin_agg(files: list[str], edges: tuple[float, ...],
+             sigma: pl.DataFrame | None,
+             limit_rows: int | None = None) -> pl.DataFrame:
+    """重活：每日 4~5M 行 -> (bucket, key) 聚合，再跨日合并成整月。
+
+    逐日聚合是刻意的：一次性对整月 1.5 亿行去重/分组需要十几 GB，Kaggle 上
+    会被 OOM killer 直接 SIGKILL。按文件切分后峰值只跟单日有关。
+    """
+    parts = []
+    for i, lf in enumerate(_scan_band(files)):
+        if limit_rows is not None:
+            if i > 0:
+                break
+            lf = lf.head(limit_rows)
+        parts.append(_collect(
+            _prepare(lf, edges, sigma).group_by(["bucket", "key"]).agg(_AGG)))
+    if not parts:
+        raise SystemExit(f"band 文件全部为空: {files[:1]}")
+    merged = _collect(
+        pl.concat(parts).lazy().group_by(["bucket", "key"]).agg(_MERGE))
+    return merged.with_columns(pl.col("n").cast(pl.Int32))
 
 
 def _side_totals(bin_agg: pl.DataFrame) -> pl.DataFrame:
@@ -237,7 +298,10 @@ def _pivot_bins(bin_agg: pl.DataFrame, bin_names: tuple[str, ...]) -> pl.DataFra
 def build_l1(band_path: str | Path, mid_path: str | Path,
              limit_rows: int | None = None,
              bin_mode: str = DEFAULT_BIN_MODE) -> pl.DataFrame:
-    """单个 band(+mid) 文件 -> 分钟截面特征表（主键 close_time）。
+    """band(+mid) -> 分钟截面特征表（主键 close_time）。
+
+    `band_path` / `mid_path` 可以是单文件、通配（一个月的日包）或 glob 列表。
+    多文件时逐日聚合再合并，日界重复的那一分钟按目录名切掉，不会重复计入。
 
     bin_mode="vol8"（默认）：按 `距离 / σ_t` 的波动率倍数分箱（v0..v4，1/2/4/8σ），
     并多输出 `ob_sigma_bps`（当期 1 分钟波动尺度）。
@@ -263,12 +327,13 @@ def build_l1(band_path: str | Path, mid_path: str | Path,
     # 除了 "bps" 以外都是波动率口径（vol / vol8 ...），都要先算 sigma
     sigma = _sigma_from_mid(mid) if bin_mode != "bps" else None
 
-    band = pl.scan_parquet(str(band_path))
-    if limit_rows is not None:
-        band = band.head(limit_rows)
+    files = sorted(glob.glob(str(band_path)))
+    if not files:
+        raise SystemExit(f"没有 band 文件匹配 {band_path}")
+    log(f"band files: {len(files)}")
 
     log(f"aggregating bins (mode={bin_mode}) ...")
-    bin_agg = _bin_agg(band, edges, sigma)
+    bin_agg = _bin_agg(files, edges, sigma, limit_rows=limit_rows)
     log(f"bin rows: {bin_agg.height:,}")
 
     df = _pivot_bins(bin_agg, names).join(mid, on="bucket", how="left")
