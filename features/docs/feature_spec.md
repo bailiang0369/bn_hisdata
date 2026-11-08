@@ -1,12 +1,14 @@
 # 订单簿 × vision 合并特征规格说明（feature_spec）
 
-> 本文件是 `features/` 模块的特征口径与列清单。产物体积小（vision ~1.7MB/月、
-> 合并表 ~40MB/月），下游可直接按 Release 拉取，不重跑管线。
+> 本文件是 `features/` 模块的特征口径与列清单。下游可直接按 Release 拉取，
+> 不重跑管线：订单簿特征在 `ob-dataset-vol8`（`ob_BTCUSDT.parquet`，**185 列**），
+> K 线在 `vision-base`，两者主键同为 `close_time`，直接 join。
 >
-> **边界**：本仓库只产出原始底座 + 订单簿衍生特征（`ob_*`），合并成
-> `BTCUSDT.parquet`（`merged-features` Release）。OHLC / 主动买卖量的衍生特征工程
-> 依赖下游预测目标、千变万化，**不在本仓库做**，下沉到下游项目；aggTrades
-> 微观结构特征（`um_agg_*` 等）经评估增益小、成本高，亦不纳入（见 DATA_ACCESS §3.1）。
+> **边界**：本仓库只产出原始底座 + 订单簿衍生特征（`ob_*`）。OHLC / 主动买卖量的
+> 衍生特征工程依赖下游预测目标、千变万化，**不在本仓库做**，下沉到下游项目；
+> aggTrades 微观结构特征（`um_agg_*` 等）经评估增益小、成本高，亦不纳入
+> （见 DATA_ACCESS §3.1）。**本表不含任何 K 线列**：`atk_*` / `ob_amp_obi_*` 由
+> `features/ob_kline_cross.py` 显式 join K 线后另存（§5 / §6）。
 
 ---
 
@@ -32,14 +34,14 @@
 ## 1. 数据流与主键
 
 ```
-data-merged 月度 band+mid ──> ob_features.py ──> L1 截面 (ob_*)
-                                                     │ 全窗口拼接 -> reindex -> 滚动 -> 校验
-                                                     ▼
-                                        build_ob_dataset.py ──> ob_BTCUSDT_{m}.parquet
-                                                                ob_BTCUSDT.parquet（全窗口）
+data-YYYY-MM 日包 ──> ob_features.py ──> L1 截面 (ob_*，61 列/交易所)
+                                            │ 全窗口拼接 -> reindex -> 滚动 -> 校验
+                                            ▼
+                               build_ob_dataset.py ──> ob_BTCUSDT_{m}.parquet
+                                                       ob_BTCUSDT.parquet（全窗口，185 列）
 
-vision-base K 线 ────────────────────────────> ob_kline_cross.py ──> atk_* / ob_amp_obi_*
-                                              （订单簿 × 成交量的跨域特征，显式 join）
+vision-base K 线 ───────────────────> ob_kline_cross.py ──> atk_* / ob_amp_obi_*
+                                     （订单簿 × 成交量的跨域特征，显式 join）
 ```
 
 订单簿特征**不掺 K 线**：盘口侧只依赖自身（futures + spot 互比），K 线更新滞后
@@ -57,7 +59,15 @@ vision-base K 线 ────────────────────�
 ## 2. L1 截面特征（每个交易所一份，`ob_f_`/`ob_s_`）
 
 所有距离统一为**相对 mid 的 bps**（`d = |px−mid|/mid × 1e4`），所有量是 **BTC 枚数**。
-深度按固定分箱 `b0..b4` = `[0,2) [2,5) [5,10) [10,20) [20,30)` bps。
+
+深度按 **vol8** 分箱：先算当期波动尺度 `σ_t`（过去 30 个 1 分钟对数收益的标准差，
+`shift(1)` 防前视、下限 0.5bps），再用 `d/σ_t` 落到 `v0..v4` =
+`[0,1) [1,2) [2,4) [4,8) [8,∞)` **倍 σ**。σ 中位数约 3.8bps、band 到 ±30bps（≈8σ），
+所以 1/2/4/8 正好铺满。相对尺度让周末低波动与美股开盘前后的分箱仍然可比。
+
+> 固定 bps 口径 `b0..b4` = `[0,2) [2,5) [5,10) [10,20) [20,30)` bps 仍保留
+> （`--bin-mode bps`），但**两套口径的 L1 不可混用**，release tag 也跟着口径走
+> （`ob-features-vol8` vs 历史的 `ob-features`）。
 
 ### 2.1 基础
 
@@ -65,14 +75,15 @@ vision-base K 线 ────────────────────�
 |---|---|---|
 | `ob_mid` | `(best_bid+best_ask)/2` | 中间价 |
 | `ob_spread_bps` | `(ask−bid)/mid ×1e4` | 相对价差 |
+| `ob_sigma_bps` | 过去 30 个 1m 对数收益的 std（bps，`shift(1)`，下限 0.5） | 当期波动尺度，也是分箱分母 |
 
-### 2.2 分箱（`{s}`=bid/ask，`{b}`=b0..b4）
+### 2.2 分箱（`{s}`=bid/ask，`{v}`=v0..v4）
 
 | 列 | 含义 |
 |---|---|
-| `ob_q_{s}_{b}` | 该箱累计挂单量（BTC） |
-| `ob_n_{s}_{b}` | 该箱档位数 |
-| `ob_vwap_{s}_{b}_bps` | 该箱量加权均价相对 mid 的 bps |
+| `ob_q_{s}_{v}` | 该箱累计挂单量（BTC） |
+| `ob_n_{s}_{v}` | 该箱档位数 |
+| `ob_vwap_{s}_{v}_bps` | 该箱量加权均价相对 mid 的 bps（空箱为 null；量与档数补 0） |
 
 ### 2.3 侧总量（`{s}`=bid/ask）
 
@@ -87,10 +98,10 @@ vision-base K 线 ────────────────────�
 
 | 列 | 公式 | 含义 |
 |---|---|---|
-| `ob_obi_total` | `(Qb−Qa)/(Qb+Qa)` | 全带不平衡 |
-| `ob_obi_b0` | 0-2bps 不平衡 | 最近端 |
-| `ob_obi_near` | 0-5bps 不平衡 | 近端 |
-| `ob_obi_far` | 10-30bps 不平衡 | 远端 |
+| `ob_obi_total` | `(Qb−Qa)/(Qb+Qa)` | 全带（±30bps）不平衡 |
+| `ob_obi_v0` | `v0` 桶（0~1σ）不平衡 | 贴价档 |
+| `ob_obi_near` | `v0+v1`（0~2σ）不平衡 | 近端 |
+| `ob_obi_far` | `v3+v4`（4σ 以上）不平衡 | 远端 |
 | `ob_obi_tilt` | `obi_far − obi_near` | 盘口形态倾斜（正=远端更偏买） |
 
 ### 2.5 价格
@@ -103,10 +114,10 @@ vision-base K 线 ────────────────────�
 
 | 列 | 公式 | 含义 |
 |---|---|---|
-| `ob_impact_bid_bps_per_btc` | `10 / Q_bid(0-10bps)` | 吃掉 10bps 需要多少量，反比冲击 |
-| `ob_impact_ask_bps_per_btc` | `10 / Q_ask(0-10bps)` | 同上（卖侧） |
+| `ob_impact_bid_bps_per_btc` | `10 / Q_bid(v0..v2 即 0~4σ)` | 打进 10 BTC 的滑点（bps），反比近端深度 |
+| `ob_impact_ask_bps_per_btc` | `10 / Q_ask(v0..v2)` | 同上（卖侧） |
 | `ob_impact_imb` | `(imp_bid−imp_ask)/(imp_bid+imp_ask)` | 冲击不对称 |
-| `ob_depth_conc_{s}` | `Q_{s}(0-5bps)/Q_{s}` | 近端深度占比 |
+| `ob_depth_conc_{s}` | `Q_{s}(v0+v1 即 0~2σ)/Q_{s}` | 近端深度占比 |
 | `ob_levels_ratio` | `n_bid/n_ask` | 档数比 |
 | `ob_qmean_{s}` | `Q_{s}/n_{s}` | 平均单档量 |
 | `ob_hhi_{s}` | `Σq²/(Σq)²` | 挂单集中度（越大越集中） |
@@ -130,6 +141,11 @@ vision-base K 线 ────────────────────�
 | `ob_spread_mean_5m/15m`、`ob_spread_std_5m/15m` | 同上 | 价差水平与波动 |
 | `ob_impact_mean_5m/15m` | `(imp_bid+imp_ask)/2` 滚动均值 | 冲击水平 |
 | `ob_obi_z_5m/15m`、`ob_spread_z_15m` | `(x−mean)/std` | 标准化 |
+| `ob_vol_med_7d_bps` | `median(|ret_1m|)` 过去 7 天，`shift(1)` | 波动基准尺度（严格因果） |
+| `ob_vol_med_60m_bps` | `median(|ret_1m|)` 过去 60 分钟 | 当前波动尺度 |
+| `ob_vol_ratio` | `med_60m / med_7d` | 当前相对基准的波动倍数 |
+| `ob_vol_bucket` | ratio 落在 `[0.8,1.0,1.25,1.6,2.0]` 的哪一段（0..5） | 波动分档（边界随波动整体平移，跨时段可比） |
+| `ob_ret_vol_norm` | `ret_1m / med_7d` | 归一化收益幅度 |
 
 > 窗口只取 **{5m, 15m}**，对齐预测周期 3/5/10/15 分钟。不用 60m 这类长窗——
 > 订单簿挂单随时可撤/新增，只对短期有效，长周期趋势该用 K 线/资金面特征。
@@ -163,7 +179,9 @@ vision-base K 线 ────────────────────�
 | `ob_amp_clip_015/035/080` | `k×amp_mean_30m > 30bps` ? 1 : 0 | 该倍数超出快照带、已被截断到 30bps |
 
 实现要点：
-- 深度在距离 `x` 处的累计量，用 L1 固定分箱做**线性插值**（箱内假设均匀）。
+- 深度在距离 `x` 处的累计量，用 L1 的 **vol8 分箱**做**线性插值**（箱内假设均匀）：
+  先把 `x` 用 `ob_f_sigma_bps` 换算成 σ 倍数，再在 `v0..v4` 上插值
+  （`σ` 为 null 时整行置 null，不臆造深度）。
 - `thr = min(k×amp_mean_30m, 30)`；`amp_mean_30m` 为空或两侧深度都为 0 时不平衡置 null。
 - 倍数取小数（0.15/0.35/0.8）：3/5 分钟涨跌只看近端订单簿。`0.8×` 实测 ~10bps，
   基本都在 30bps 带内，`ob_amp_clip_*` 仅在振幅极端时才会标 1。
@@ -211,8 +229,14 @@ vision-base K 线 ────────────────────�
 
 ## 9. 消费注意事项
 
-- 列类型：`close_time` 为 i64，`ob_mid`（合并后 `ob_f_mid`/`ob_s_mid`）为 f64，
-  其余均为 f32。所有特征已做非有限值清洗（inf/NaN → null）。
-- 月份文件按 `close_time` 月归属切分，边界与 vision 一致；逐月拼接无缺口。
-- `metrics` 源列（`sum_open_interest` 起 6 列）是 5 分钟粒度前向填充，勿当分钟独立信号。
-- 两端 `ob_f_mid` / `ob_s_mid` 是同一中间价的两次记录，数值近乎相等（差 = ob_basis_bps）。
+- **取数**：直接拉 `ob-dataset-vol8` 的 `ob_BTCUSDT.parquet`。185 列 =
+  `close_time` + futures 90 + spot 90 + 跨市场 4；按组的列清单见
+  `DATA_ACCESS.md` §3.3，不用自己跑管线。
+- **列类型**：`close_time` 为 i64，`{p}mid` 为 f64；L1 截面特征一律 f32，
+  L2 滚动/差分特征为 f64；`{p}missing` / `{p}vol_bucket` 为 i8。
+  **按列名取值，不要按位置**。
+- 非有限值（inf/NaN）已统一置 null（除零产生的 inf 曾会静默污染下游）。
+- 月份文件按 `close_time` 月归属切分（月末最后一分钟归当月），逐月拼接无缺口。
+- 本表**不含 K 线**：`metrics` 6 列已在 2026-11 整体移出基础表（见 DATA_ACCESS §3.1），
+  `atk_*` / `ob_amp_obi_*` 要另跑 `ob_kline_cross.py`。
+- 两端 `ob_f_mid` / `ob_s_mid` 是同一中间价的两次记录，差值即 `ob_basis_bps`。

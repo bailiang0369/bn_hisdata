@@ -13,26 +13,33 @@
 
 ---
 
-## 1. 三个 Release 是什么
+## 1. Release 一览
+
+**做研究/建模只需要两个 tag**：K 线用 `vision-base`，订单簿特征用 `ob-dataset-vol8`。
+两者主键都是 `close_time`（Int64 ms UTC），可以直接 join。
 
 | Release tag | 资产 | 命名 | 体量 | 用途 |
 |---|---|---|---|---|
 | `vision-base` | 每标的每年 1 个 parquet | `{SYMBOL}_1m_klines_{YYYY}.parquet` | 每年约 20–30 MB | **主用**。原始 1m K 线（um + spot，15 列），**不是特征**，每日自动更新 |
-| `data-merged` | 64 个 parquet | `{exchange}_minute_band_{YYYY-MM}.parquet`<br>`{exchange}_minute_band_mid_{YYYY-MM}.parquet` | 10.5 GB | **主用**。L2 订单簿的分钟级窄带快照 |
-| `data-{YYYY-MM}` | 每日 zip | `{YYYY-MM-DD}.zip` | 16 个月，~10 GB | 重建的**中间态**（每日 band+mid + 原始小时文件），正常消费**不需要** |
-| `ob-features` | 32 个 parquet | `ob_features_{exchange}_{YYYY-MM}.parquet` | 约 100 MB | 订单簿 L1 截面特征（中间态，供 merged 重建） |
-| `merged-features` | 17 个 parquet | `merged_BTCUSDT_{YYYY-MM}.parquet`（逐月）<br>`BTCUSDT.parquet`（全窗口单文件，**最终交付**） | 约 200 MB | **主用**。订单簿 + vision 合并宽表 |
+| `ob-dataset-vol8` | 17 个 parquet | `ob_BTCUSDT_{YYYY-MM}.parquet`（逐月）<br>`ob_BTCUSDT.parquet`（全窗口，**推荐**） | 月度 16–26 MB<br>全窗口 ~375 MB | **主用**。订单簿特征（**185 列**，仅盘口，不含 K 线），见 §3.3 |
+| `ob-features-vol8` | 32 个 parquet | `ob_features_{exchange}_{YYYY-MM}.parquet` | 约 250 MB | L1 截面**中间态**（每交易所各自一份，重算数据集用；正常消费不需要） |
+| `data-merged` | 64 个 parquet | `{exchange}_minute_band_{YYYY-MM}.parquet`<br>`{exchange}_minute_band_mid_{YYYY-MM}.parquet` | 10.5 GB | L2 原始窄带快照（要自己重算盘口特征时才用，见 §3.2） |
+| `data-{YYYY-MM}` | 每日 zip | `{YYYY-MM-DD}.zip` | 16 个月，~10 GB | 重建的**中间态**（每日 band+mid），正常消费**不需要** |
+| `ob-features` | 32 个 parquet | `ob_features_{exchange}_{YYYY-MM}.parquet` | 约 100 MB | **历史**：固定 bps 分箱（`b0..b4`）口径，与 vol8 不可混用 |
+| `merged-features` | 17 个 parquet | `merged_BTCUSDT_{YYYY-MM}.parquet`<br>`BTCUSDT.parquet` | 约 200 MB | **历史**：订单簿 + K 线的合并宽表，仅保留给既有 bn_bt 模型；新项目请用上面两套自己 join |
 
-- `SYMBOL`：`BTCUSDT` / `ETHUSDT`
+- `SYMBOL`：`BTCUSDT` / `ETHUSDT`（`ob-dataset-vol8` 当前只有 `BTCUSDT`）
 - `exchange`：`binance_futures`（U 本位合约）/ `binance_spot`（现货）
 - 年份：`vision-base` 为 `2020` … `2026`（`2020-01-01` 起），每标的每年一个文件；
   **当年那份仍在增长**，跨年后冻结不再改动
-- 月份：`2025-07` … `2026-10`（仅订单簿侧），每个 tag 内该标的/交易所**月份齐全，没有缺月**
+- 月份：`2025-07` … `2026-10`（订单簿侧），每个 tag 内月份齐全、没有缺月。
+  **订单簿目前是手动/月度重建，不是每日自动更新**（覆盖到哪天以最新资产为准）
 
 资产直链（公开仓库，**无需 token**）：
 
 ```
 https://github.com/bailiang0369/bn_hisdata/releases/download/vision-base/BTCUSDT_1m_klines_2026.parquet
+https://github.com/bailiang0369/bn_hisdata/releases/download/ob-dataset-vol8/ob_BTCUSDT_2025-08.parquet
 https://github.com/bailiang0369/bn_hisdata/releases/download/data-merged/binance_futures_minute_band_mid_2025-07.parquet
 ```
 
@@ -46,11 +53,15 @@ Release 都标了 **prerelease**，但内容可用；`gh release download` 需�
 ### 2.1 用 gh CLI
 
 ```bash
-# 只要 vision 的 BTCUSDT，全部年份（约 2 个文件、几十 MB）
+# K 线：BTCUSDT 全部年份（2 个文件、几十 MB）
 gh release download vision-base --repo bailiang0369/bn_hisdata \
     --pattern 'BTCUSDT_1m_klines_*.parquet' --dir ./data/vision
 
-# 只要订单簿 mid（每分钟一行，做时间对齐最常用）
+# 订单簿特征：全窗口单文件（推荐，375 MB）
+gh release download ob-dataset-vol8 --repo bailiang0369/bn_hisdata \
+    --pattern 'ob_BTCUSDT.parquet' --dir ./data/ob
+
+# 只要订单簿原始 mid（每分钟一行，自己算特征时用）
 gh release download data-merged --repo bailiang0369/bn_hisdata \
     --pattern 'binance_futures_minute_band_mid_*.parquet' --dir ./data/ob
 ```
@@ -59,10 +70,42 @@ gh release download data-merged --repo bailiang0369/bn_hisdata \
 
 ```bash
 python tools/fetch_release.py --tag vision-base --pattern 'BTCUSDT_*' --dest ./data/vision
+python tools/fetch_release.py --tag ob-dataset-vol8 --pattern 'ob_BTCUSDT_*.parquet' --dest ./data/ob
 python tools/fetch_release.py --tag data-merged --pattern '*minute_band_mid_*' --dest ./data/ob
+
+# 先看这个 tag 里有什么（不下载）
+python tools/fetch_release.py --tag ob-dataset-vol8 --list
 ```
 
-### 2.3 按年/按月懒加载（不下全量）
+### 2.3 最小可跑样本（接新项目时先跑这个）
+
+别一上来就拉全量。最小组合 = **1 年 K 线 + 1 个月订单簿特征**，约 55 MB、
+30 秒内下完，足够验证读表、对齐、列名：
+
+```bash
+python tools/fetch_release.py --tag vision-base \
+    --pattern 'BTCUSDT_1m_klines_2025.parquet' --dest ./data/vision
+python tools/fetch_release.py --tag ob-dataset-vol8 \
+    --pattern 'ob_BTCUSDT_2025-08.parquet' --dest ./data/ob
+
+python - <<'PY'
+import polars as pl
+k = pl.read_parquet("data/vision/BTCUSDT_1m_klines_2025.parquet")
+ob = pl.read_parquet("data/ob/ob_BTCUSDT_2025-08.parquet")
+print(k.shape, ob.shape)                     # (525600, 15)  (44640, 185)
+df = k.join(ob, on="close_time", how="inner")  # 两侧同键，直接 join
+print(df.shape, df["ob_f_ret_1m_bps"].null_count())   # (44640, 199) ...
+assert df.height > 44_000
+PY
+```
+
+> Windows PowerShell 不支持 `<<'PY'` 这种 heredoc，把中间那段存成 `check.py` 再
+> `python check.py` 即可。
+
+想连原始盘口一起验，再加一个月的 `data-merged` 的 `*_band_mid_*`（注意它的主键是
+`bucket`，对齐要 `close_time - 60000`，见 §4）。
+
+### 2.4 按年/按月懒加载（不下全量）
 
 单年 vision 文件约 20–30 MB（1 分钟粒度、每标的每年 52.5 万行），ob 月度 band
 几十~一两百 MB。研究阶段完全可以只拉用到的那几年/几个月：
@@ -115,7 +158,7 @@ def fetch(tag: str, name: str, dest: pathlib.Path) -> pathlib.Path:
   taker 主动买卖量比同理由 `um_buy_vol / um_sell_vol` 自算（1 分钟、无回填）。
 - 这是**默认**产出的 **base** 表，**不含** aggTrades 微观结构列（`um_agg_*`、`spot_agg_*`、
   `rv_dominance` 共 20 列；只有显式加 `--with-agg` 才会产出完整 master 表）。
-  OHLC / 主动买卖量的衍生特征工程一律下沉到下游项目（见 §3.3 的合并宽表）。
+  OHLC / 主动买卖量的衍生特征工程一律下沉到下游项目（现成底座见 §3.3 订单簿特征）。
 
 **aggTrades 为什么不做（2026-11 决策 + 专项实测）**
 
@@ -184,29 +227,75 @@ def fetch(tag: str, name: str, dest: pathlib.Path) -> pathlib.Path:
 - （历史）vision 侧的 metrics 列曾有零星空值，2026-11 起 metrics 已整体移出基础表，
   该问题不再存在。
 
-### 3.3 `merged-features`：订单簿 + vision 合并宽表（最终交付）
+### 3.3 `ob-dataset-vol8`：订单簿特征（185 列）
 
-- `BTCUSDT.parquet`：**全窗口单文件**，下游项目直接用这个（推荐）。
-- `merged_BTCUSDT_{YYYY-MM}.parquet`：逐月中间态，供单月消费 / 增量重跑。
+- `ob_BTCUSDT.parquet`：**全窗口单文件**（2025-07 ~ 2026-10 共 16 个月，
+  约 70 万行，375 MB），下游直接用这个（推荐）。
+- `ob_BTCUSDT_{YYYY-MM}.parquet`：逐月，供单月消费 / 增量重跑。
 
-列 = vision-base 全部 15 列 + 订单簿衍生特征（`ob_f_*` / `ob_s_*` 前缀 + 跨市场
-`ob_basis_bps` 等 + 振幅 `amp_*`/`ob_amp_*` + 攻防 `atk_*`）。完整列清单与口径见
-`features/docs/feature_spec.md`。
+**主键 `close_time`**，与 `vision-base` 同键同语义，`join(on="close_time")` 即可，
+**不需要** 减 60000（那是 `data-merged` 的 `bucket` 才有的换算，见 §4）。
 
-- 主键 `close_time`，逐分钟无缝；订单簿侧缺分钟的 `ob_*` 置 null 并打 `ob_missing=1`。
-- 这是**特征原料底座**：OHLC / 主动买卖量的衍生特征工程**不在本仓库做**，下游项目
-  在此底座上自由构造（见 §3.1 的 aggTrades 决策与边界）。
+列构成：`1 + 90 + 90 + 4 = 185`——`close_time` + futures 块 + spot 块 + 跨市场。
+两块完全对称，futures 用前缀 `ob_f_`、spot 用 `ob_s_`（下表把前缀写成 `{p}`）。
+
+| 组 | 列 | 数量 |
+|---|---|---|
+| 中间价 | `{p}mid` | 1 |
+| 深度分箱量 | `{p}q_{bid,ask}_v0..v4` | 10 |
+| 深度分箱档数 | `{p}n_{bid,ask}_v0..v4` | 10 |
+| 分箱 VWAP（相对 mid，bps） | `{p}vwap_{bid,ask}_v0..v4_bps` | 10 |
+| 波动尺度 | `{p}sigma_bps`（过去 30 分钟 1m 收益标准差） | 1 |
+| 价差 | `{p}spread_bps` | 1 |
+| 侧总量 | `{p}q_bid` `{p}q_ask` `{p}n_bid` `{p}n_ask` | 4 |
+| 最大单档 | `{p}qmax_{bid,ask}` `{p}qmax_dist_bps_{bid,ask}` | 4 |
+| 不平衡 | `{p}obi_total` `{p}obi_v0` `{p}obi_near` `{p}obi_far` `{p}obi_tilt` | 5 |
+| 加权中价 | `{p}wmid_bps` | 1 |
+| 冲击 | `{p}impact_{bid,ask}_bps_per_btc` `{p}impact_imb` | 3 |
+| 深度形态 | `{p}depth_conc_{bid,ask}` `{p}levels_ratio` `{p}qmean_{bid,ask}` `{p}hhi_{bid,ask}` `{p}qmax_ratio_{bid,ask}` `{p}qcv_{bid,ask}` | 11 |
+| 缺分钟标记 | `{p}missing`（1=该分钟源端无盘口，`{p}*` 全 null） | 1 |
+| 收益 | `{p}ret_1m_bps` | 1 |
+| 一阶差分 | `{p}dobi_1m` `{p}dobi_5m` `{p}ddepth_bid_1m` `{p}ddepth_ask_1m` `{p}ddepth_bid_5m` `{p}dwmid_1m` `{p}dspread_1m` | 7 |
+| 5m / 15m 滚动 | `{p}rv_{5m,15m}_bps`、`{p}obi_mean/std_{5m,15m}`、`{p}spread_mean/std_{5m,15m}`、`{p}impact_mean_{5m,15m}` | 12 |
+| 滚动 z-score | `{p}obi_z_5m` `{p}obi_z_15m` `{p}spread_z_15m` | 3 |
+| 波动自适应 | `{p}vol_med_7d_bps` `{p}vol_med_60m_bps` `{p}vol_ratio` `{p}vol_bucket` `{p}ret_vol_norm` | 5 |
+| 跨市场 | `ob_basis_bps` `ob_depth_ratio_f_s` `ob_spread_ratio_f_s` `ob_lead_f_s_bps` | 4 |
+
+- 分箱口径是 **vol8**：`|px−mid|/mid / σ_t` 落在 `[1,2,4,8]σ` 的哪一段（`v0..v4`），
+  所以分箱既跨交易所可比、也跨波动时段可比。
+- 单位：距离一律 bps，量一律 BTC；`close_time` 为 Int64，`{p}mid` 为 f64，
+  其余特征为 f32/f64 混排（按列名取值，不要按位置）。
+- 缺分钟不补数：reindex 到连续分钟网格后 `{p}mid` 为 null、`{p}missing=1`，
+  滚动窗口按日历时间滑过缺口。建模前自行 drop 或填充。
+- `ob_*` 在 `close_time=t` 表示"第 t 根 bar 收盘瞬间的盘口"，用它预测 t+1 及以后无前视；
+  **不要**用它解释同一根 bar 的收益（同一时刻，内生）。
+- 公式级口径见 [`features/docs/feature_spec.md`](features/docs/feature_spec.md)；
+  本表**不含 K 线**，成交 × 挂单（`atk_*`）、振幅倍数不平衡（`ob_amp_obi_*`）由
+  `features/ob_kline_cross.py` 显式 join K 线后生成（键仍是 `close_time`）。
+
+### 3.4 `merged-features`（历史，逐步退役）
+
+`BTCUSDT.parquet` = vision-base 15 列 + 订单簿特征 + `amp_*` / `atk_*` 的合并宽表，
+只保留给既有 bn_bt 模型消费。新项目请用 `vision-base` + `ob-dataset-vol8` 自己 join
+（§5 有现成代码）。
 
 ---
 
 ## 4. 时间对齐（最容易踩的地方）
 
-两个数据集用的是**不同锚点**，差整整一分钟：
+**先看你的订单簿数据是哪一层**——`ob-dataset-vol8` 已经转成 `close_time`，
+可以**直接 join**；只有 `data-merged` / `data-{YYYY-MM}` 的原始 `bucket` 才差一分钟。
 
-| 数据集 | 时间列 | 语义 |
+| 数据 | 时间列 | 语义 |
 |---|---|---|
 | `vision-base` | `close_time` | 该 bar 的**结束**时刻 +1ms = **下一分钟起点**。例：`close_time = 2026-06-01T00:00:00.000Z` 对应的 bar 覆盖 `05-31 23:59:00 ~ 06-01 00:00:00` |
-| 订单簿 | `bucket` | 该分钟的**起点**，状态取 `[bucket, bucket+60s)` 内最后一条消息之后 |
+| `ob-dataset-vol8` | `close_time` | 同上（`close_time = bucket + 60000` 已由生产端换算），**直接 join** |
+| `data-merged` / `data-{YYYY-MM}` | `bucket` | 该分钟的**起点**，状态取 `[bucket, bucket+60s)` 内最后一条消息之后 |
+
+```python
+# 订单簿特征 + K 线：同键，直接 join（推荐路径）
+feat = k.join(ob, on="close_time", how="inner")
+```
 
 **对齐公式**：同一根 bar 的盘口状态是
 
@@ -257,6 +346,10 @@ feat = vision.join(ob_mid, left_on=(pl.col("close_time") - 60_000), right_on="bu
 ---
 
 ## 5. 整合成一宽表（可直接抄）
+
+> 只要订单簿**特征**、不想自己算盘口，就别走这一节：`ob-dataset-vol8` 已经是
+> `close_time` 主键，`k.join(ob, on="close_time")` 一行搞定（见 §3.3）。
+> 下面是从**原始 band/mid** 自己拼研究表的完整示例（要自定义特征时才需要）。
 
 ```python
 """把 vision-base + 订单簿 mid 按分钟对齐成一张研究宽表。"""
@@ -348,11 +441,17 @@ assert k.select(pl.col("bucket").diff().drop_nulls().max()).collect().item() == 
 | 产物 | 生产脚本 | 说明 |
 |---|---|---|
 | `vision-base` | `binance_vision/pipeline_daily.py`（每日，`.github/workflows/vision-daily.yml`）<br>`binance_vision/kaggle/vision_run.py`<br>`binance_vision/run_base_table_cloud.sh` | 日常：`update` 补 UTC 昨天 → 并入**当年**年度 parquet → 覆盖发布（历史年份不重写）；首次/补洞：`backfill --start ... ` 按年聚合后每年上传一次 |
-| `data-YYYY-MM` | `orderbook/kaggle/run_orderbook.py` | 逐天 `pipeline.py` → 打包 `{date}.zip` 上传，支持断点续传 |
+| `data-YYYY-MM` | `orderbook/kaggle/run_orderbook.py` | 逐天 `pipeline.py` → 打包 `{date}.zip` 上传，支持断点续传（**手动/批量运行，不自动**） |
 | `data-merged` | `orderbook/kaggle_merge/merge_run.py` | 拉每日 zip → `merge_monthly.py` → 传 `data-merged` |
-| `ob-features-{mode}`<br>`ob-dataset-{mode}` | `features/kaggle/run_features.py` | 拉 data-merged → `ob_features.py` 算 L1 → `build_ob_dataset.py` 滚动成订单簿数据集（**不含 K 线**）→ 传 L1 与 `ob_BTCUSDT_{m}.parquet` + 单文件 `ob_BTCUSDT.parquet`。跨域特征（成交 vs 挂单）用 `features/ob_kline_cross.py` 单独 join K 线，在 bn_bt 侧或单独跑 |
+| `ob-features-{mode}`<br>`ob-dataset-{mode}` | `features/kaggle/run_features.py` | 直接拉 `data-YYYY-MM` 日包（不再依赖 `data-merged`）→ `ob_features.py` 算 L1 → `build_ob_dataset.py` 全窗口滚动成订单簿数据集（**不含 K 线**）→ 传 L1 与 `ob_BTCUSDT_{m}.parquet` + 单文件 `ob_BTCUSDT.parquet`。跨域特征（成交 vs 挂单）用 `features/ob_kline_cross.py` 单独 join K 线 |
 | ~~`merged-features`~~ | （历史）`features/build_dataset.py` | 已拆分为上面两段：订单簿数据集 + 跨域特征。<br>该 Release 是旧的「订单簿 + K 线」合并宽表，仅保留给现有 bn_bt 模型消费 |
 
 - 凭据一律走环境变量或 Kaggle Secrets（`GH_TOKEN` / `CHD_API_KEY` / `KAGGLE_USERNAME` /
   `KAGGLE_KEY`），**代码里不留密钥**（仓库是 public）。
-- 扩窗口 = 改脚本里的 `START` / `END` 重推内核，产物按月增量，已有的月份会自动 skip。
+- 扩窗口 = 改脚本里的 `START` / `END` 重推内核，产物按月增量，已有的月份会自动 skip；
+  **边界月**（`END` 落在月中）的 L1 会按 `close_time` 覆盖度自动判定并重算覆盖上传。
+- 只有 K 线是每日自动更新的（`vision-daily.yml`，用内置 `GITHUB_TOKEN`）。订单簿链路
+  需要 CryptoHFTData 的 `CHD_API_KEY`，目前**按需/按月重跑**：`run_orderbook.py` →
+  `merge_run.py` → `run_features.py` 三步，每一步都断点续传。
+- 测试：`python -m pytest -q`（仓库根，约 10s）。`orderbook/bench_r2_speed.py`、
+  `orderbook/test_download.py` 是**手动**联网脚本，不参与收集。

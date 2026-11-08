@@ -10,6 +10,8 @@ BTCUSDT 历史数据工程。按数据源与处理逻辑分模块组织：
   klines 拆成主动买/卖成交量（`buy_vol` / `sell_vol`）、校验和校验、按天/按月、
   断点续传。处理逻辑与订单簿完全不同，故独立成模块。踩坑与决策史见
   `binance_vision/docs/binance_vision_lessons.md`。
+- `features/` — 在分钟快照之上算订单簿特征（L1 截面 → 全窗口滚动），产物发
+  `ob-dataset-vol8`。口径见 `features/docs/feature_spec.md`。
 
 ## 已发布的数据（下游项目直接取，不用跑管线）
 
@@ -18,15 +20,34 @@ parquet 已经发布在本仓库的 GitHub Release，1 分钟粒度（UTC，Int6
 | Release | 内容 | 资产命名 | 体量 |
 |---|---|---|---|
 | `vision-base` | **原始 1m K 线**（um + spot 各 7 列，15 列；不是衍生特征），BTCUSDT / ETHUSDT，**`2020-01-01` 至今**，每天自动更新 | `{SYMBOL}_1m_klines_{YYYY}.parquet`（**每标的每年一个**，当年那份持续增长） | ~20–30 MB / 年 |
-| `data-merged` | L2 订单簿分钟快照（futures + spot） | `{exchange}_minute_band[_mid]_{YYYY-MM}.parquet` | 10.5 GB / 64 个 |
+| `ob-dataset-vol8` | **订单簿特征**（185 列，仅盘口、不含 K 线），BTCUSDT，`2025-07` ~ `2026-10` | `ob_BTCUSDT_{YYYY-MM}.parquet`（逐月）<br>`ob_BTCUSDT.parquet`（全窗口，推荐） | 16–26 MB/月，全窗口 375 MB |
+| `ob-features-vol8` | 订单簿 L1 截面中间态（重算数据集时用，消费端不需要） | `ob_features_{exchange}_{YYYY-MM}.parquet` | ~250 MB / 32 个 |
+| `data-merged` | L2 订单簿分钟快照（futures + spot，自己算盘口特征时才用） | `{exchange}_minute_band[_mid]_{YYYY-MM}.parquet` | 10.5 GB / 64 个 |
 | `data-{YYYY-MM}` | 重建中间态（每日 zip，**消费端用不到**） | `{YYYY-MM-DD}.zip` | ~10 GB |
 
-一行取数（全部年份 = 2 个文件、一次并发拉完）：
+一行取数（`vision-base` 全部年份 = 2 个文件；订单簿特征按月或整份）：
 
 ```bash
 python tools/fetch_release.py --tag vision-base --pattern 'BTCUSDT_*' --dest ./data/vision
+python tools/fetch_release.py --tag ob-dataset-vol8 --pattern 'ob_BTCUSDT.parquet' --dest ./data/ob
 python tools/fetch_release.py --tag data-merged --pattern '*minute_band_mid_*' --dest ./data/ob
+
+# 只想要一个月（接新项目先跑这个级别的样本，约 26 MB）
+python tools/fetch_release.py --tag ob-dataset-vol8 --pattern 'ob_BTCUSDT_2025-08.parquet' --dest ./data/ob
 ```
+
+两个主用数据集**主键相同**（`close_time`），直接 `join`：
+
+```python
+import polars as pl
+k = pl.scan_parquet("data/vision/BTCUSDT_1m_klines_2025.parquet")
+ob = pl.scan_parquet("data/ob/ob_BTCUSDT_2025-08.parquet")
+lf = k.join(ob, on="close_time", how="inner")     # 不需要 -60000，那是 data-merged 的 bucket
+```
+
+> 只有 K 线是每天自动更新的；订单簿链路需要 CryptoHFTData 的 `CHD_API_KEY`，
+> 目前**按需/按月重跑**（`run_orderbook.py` → `merge_run.py` → `run_features.py`），
+> 最新覆盖到 `2026-10`。
 
 为什么按年切而不发一个全量文件：全量单文件意味着每天更新都要下载整个历史、再重传
 整个历史，IO 随历史线性增长；按年后增量只碰当年那一个文件，历史年份写完即冻结。
@@ -37,8 +58,9 @@ python tools/fetch_release.py --tag data-merged --pattern '*minute_band_mid_*' -
 逐日明细见 [`DATA_STATUS.md`](DATA_STATUS.md)。
 
 **schema、时间对齐口径、整合示例、踩坑清单见[`DATA_ACCESS.md`](DATA_ACCESS.md)**。
-其中最要紧的一条：K 线侧 `close_time` 与订单簿侧 `bucket` 差**一分钟**
-（`bucket == close_time - 60000`），写漏了不会报错，只会静默错位。
+`vision-base` 与 `ob-dataset-vol8` 都是 `close_time`，直接 join；只有 `data-merged`
+的原始 `bucket` 与它差**一分钟**（`bucket == close_time - 60000`），写漏了不会报错，
+只会静默错位。
 
 ## 全链路一键（推荐）
 
@@ -46,8 +68,8 @@ python tools/fetch_release.py --tag data-merged --pattern '*minute_band_mid_*' -
 命令即可：
 
 ```bash
-git clone https://github.com/bailiang0369/bn_hisdata.git /mnt/workspace/bn_hisdata
-cd /mnt/workspace/bn_hisdata
+git clone https://github.com/bailiang0369/bn_hisdata.git ~/bn_hisdata
+cd ~/bn_hisdata
 tmux new -s data
 CHD_API_KEY=xxx bash run_all_cloud.sh 2>&1 | tee run_all.log
 ```
@@ -57,12 +79,9 @@ CHD_API_KEY=xxx bash run_all_cloud.sh 2>&1 | tee run_all.log
 可用 `SKIP_VISION=1` / `SKIP_ORDERBOOK=1` 只跑一半；`START/END/JOBS/LEAN`
 环境变量可覆盖（默认窗口 `2025-06-01 ~ 昨天`）。
 
-**必须在不会因闲置被回收的机器上跑**：魔搭 DSW 空闲约 1 小时就收实例，过夜没人
-盯着不行；Jules 之类的一次性云 VM 也不行（任务结束 VM 即销毁，产出只能走 git
-分支带回，10GB+ 的 parquet 不可能这么搬）。用按量付费的持久小机器
-（AutoDL / 智星云 / ECS，系统盘 40GB+ 足够：原始按天删，峰值只压当天数据，
-最终产物 ~10GB）。时长参考（~490 天窗口）：vision 1–3h，orderbook 两市场串行
-~17h（弱机下限；现代 4+ vCPU 约 6–10h，实测与调优记录见
+**要在不会被闲置回收的机器上跑**，系统盘 40GB+ 即可（原始按天删，峰值只压当天
+数据，最终产物 ~10GB）。时长参考（~490 天窗口）：vision 1–3h，orderbook 两市场
+串行 ~17h（弱机下限；4+ vCPU 约 6–10h，实测与调优记录见
 `orderbook/docs/orderbook_lessons.md` §7 / §11）。
 
 ## orderbook 模块
@@ -74,7 +93,7 @@ CHD_API_KEY=xxx bash run_all_cloud.sh 2>&1 | tee run_all.log
 python orderbook/pipeline.py --date 2026-10-12
 python orderbook/pipeline.py --start-date 2025-06-01 --end-date 2025-06-30 --download r2
 
-# 小内存 VM（如一次性 Jules/云 VM）省内存：sparse 模式（中间结构小 8 倍、快 ~15%，
+# 内存较小的机器省内存：sparse 模式（中间结构小 8 倍、快 ~15%，
 # 任一分钟窗口不可证明时自动回退 dense，见 orderbook/docs/orderbook_lessons.md §12）
 python orderbook/pipeline.py --date 2026-10-12 --mode sparse
 
@@ -94,6 +113,29 @@ python orderbook/merge_monthly.py --dest-root orderbook/data
 >
 > 在 **Kaggle** 上跑本模块并归档到 Kaggle Dataset 的完整步骤见
 > `orderbook/docs/kaggle_runbook.md`（含断点续传、跨会话持久化、发布前校验门禁设计）。
+
+## features 模块（订单簿特征）
+
+`orderbook/` 只负责把原始逐笔重建成分钟快照；**特征工程在 `features/`**：
+
+```
+data-YYYY-MM 日包 ──> ob_features.py ──> L1 截面（61 列/交易所）
+                                          │ 全窗口 reindex + 滚动（跨月不截断）
+                                          ▼
+                              build_ob_dataset.py ──> ob_BTCUSDT_{m}.parquet / ob_BTCUSDT.parquet
+```
+
+```bash
+# 单月 L1（本地冒烟要加 --limit-rows；全量在 Kaggle 上跑）
+python features/ob_features.py --band 'orderbook/data/2026-09-*/*_minute_band.parquet' \
+    --mid 'orderbook/data/2026-09-*/*_minute_band_mid.parquet' --out /tmp/l1.parquet
+# 全窗口滚动 + 校验 -> 月度 / 单文件
+python features/build_ob_dataset.py --fut '/tmp/l1_futures_*.parquet' \
+    --spot '/tmp/l1_spot_*.parquet' --out-dir /tmp/ob
+```
+
+列口径（分箱、公式、前视约定）见 [`features/docs/feature_spec.md`](features/docs/feature_spec.md)；
+取数可直接看 [`DATA_ACCESS.md`](DATA_ACCESS.md) §3.3，不用自己跑。
 
 ## binance_vision 模块
 
@@ -149,8 +191,9 @@ python binance_vision/build_master_features.py --symbol BTCUSDT
 # 此时缺 um aggTrades 会硬失败（缺 spot 只警告）。
 python binance_vision/build_master_features.py --symbol BTCUSDT --with-agg
 
-# 单元测试（从仓库根运行；根目录 conftest.py 负责把仓库根加入 sys.path）
-python -m pytest binance_vision -q
+# 单元测试（从仓库根运行；conftest.py 负责把仓库根加入 sys.path）
+# 全仓约 45 个用例、10s 内跑完；联网的手动脚本（test_download.py / bench_r2_speed.py）不参与收集
+python -m pytest -q
 ```
 
 aggTrades 特征按 1m 窗口聚合后 join 到宽表（窗口右边界 == K 线 `close_time`），
@@ -178,7 +221,7 @@ um 侧加 `um_agg_` 前缀、spot 侧加 `spot_agg_` 前缀。只保留 K 线给
 >     binance_vision/data/um/daily/aggTrades/BTCUSDT --timeframe 1m
 > ```
 >
-> 魔搭上一键第二阶段（下载两市场 aggTrades + 预聚合 + 重建 master）：
+> 两市场 aggTrades 一键（下载 + 预聚合 + 重建 master）：
 > `bash binance_vision/run_aggtrades_cloud.sh`。
 
 数据默认落在各模块自己的 `data/` 目录（已在 `.gitignore` 中忽略，不入库）。项目依赖见
