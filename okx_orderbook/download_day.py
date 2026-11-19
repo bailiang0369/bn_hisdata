@@ -96,7 +96,7 @@ def get_download_urls(d: date, inst_type: str, inst_id: str, levels: int,
                     tag = "400lv" if levels == 400 else "5000lv"
                     if tag not in name:
                         continue
-                    size = int(g.get("sizeMB", 0) * 1e6)
+                    size = int(float(g.get("sizeMB", 0) or 0) * 1e6)
                     out.append((name, url, size))
             return out
         except Exception as e:
