@@ -23,7 +23,7 @@ from pathlib import Path
 import polars as pl
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = HERE.parent   # bn_hisdata/
 sys.path.insert(0, str(ROOT / "okx_orderbook"))
 sys.path.insert(0, str(ROOT / "features"))
 

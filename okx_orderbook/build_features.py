@@ -24,7 +24,7 @@ from pathlib import Path
 import polars as pl
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent  # bn_hisdata/
+ROOT = HERE.parent  # bn_hisdata/
 sys.path.insert(0, str(ROOT / "features"))
 
 from ob_features import build_l1  # noqa: E402
