@@ -19,7 +19,7 @@ OKX 历史数据门户的前端调用私有接口生成下载链接：
 ```
 POST https://www.okx.com/priapi/v5/broker/public/trade-data/download-link
 {
-  "module": 10,                       // ORDER_BOOK
+  "module": 4,                        // 400档订单簿（5=5000档；10 是 UI dialogType，API 不认）
   "instType": "SWAP"|"SPOT"|"FUTURES",
   "instQueryParam": {
     "instIdList": ["BTC-USDT"],       // SPOT 用这个
@@ -36,6 +36,13 @@ POST https://www.okx.com/priapi/v5/broker/public/trade-data/download-link
 
 响应：`data.details[].groupDetails[]`，每项含 `filename / sizeMB / url`。
 **真实下载 URL 来自接口返回，不硬编码 CDN 域名**（OKX 换域名时不会失效）。
+
+**实测确认（2026-11-19，module 探测）**：
+- `module=4` → `BTC-USDT-SWAP-L2orderbook-400lv-YYYY-MM-DD.tar.gz`，**388.59 MB/天**
+- `module=5` → 5000 档（未测大小）
+- `module=1` → `BTC-USDT-SWAP-trades-YYYY-MM-DD.zip`，11.98 MB/天
+- 下载域名 `static.okx.com/cdn/okx/match/orderbook/L2/400lv/daily/...`
+- 16 个月（2025-07~2026-10）压缩总量约 **190 GB**，非之前估的 TB 级
 
 其他模块值（备用）：TRADE_HISTORY=1, CANDLESTICK=2, FUNDING_RATES=3, INTEREST_RATE=11。
 

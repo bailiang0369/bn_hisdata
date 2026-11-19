@@ -43,7 +43,9 @@ import requests
 
 HERE = Path(__file__).resolve().parent
 API = "https://www.okx.com/priapi/v5/broker/public/trade-data/download-link"
-MODULE_ORDER_BOOK = 10
+# API 的 module：4=ORDER_BOOK_400, 5=ORDER_BOOK_5000（不是 UI dialogType 的 10）
+MODULE_ORDER_BOOK_400 = 4
+MODULE_ORDER_BOOK_5000 = 5
 UA = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
 TIMEOUT = 180
 RETRIES = 4
@@ -64,7 +66,7 @@ def get_download_urls(d: date, inst_type: str, inst_id: str, levels: int,
     """返回 [(filename, url), ...]，来自 download-link 接口。"""
     is_spot = inst_type.upper() == "SPOT"
     payload = {
-        "module": MODULE_ORDER_BOOK,
+        "module": MODULE_ORDER_BOOK_400 if levels == 400 else MODULE_ORDER_BOOK_5000,
         "instType": inst_type.upper(),
         "instQueryParam": {
             "instIdList": [inst_id] if is_spot else None,
