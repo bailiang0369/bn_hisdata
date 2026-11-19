@@ -33,6 +33,7 @@ OKX 官方历史数据门户（https://www.okx.com/en-us/historical-data）提�
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -133,12 +134,17 @@ def download(url: str, dst: Path, session: requests.Session, expect: int = 0) ->
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Download OKX L2 orderbook daily archive")
-    ap.add_argument("--date", required=True, help="UTC date YYYY-MM-DD")
-    ap.add_argument("--inst-type", default="SWAP", choices=["SWAP", "SPOT", "FUTURES"])
-    ap.add_argument("--inst-id", default="BTC-USDT", help="SPOT 用 BTC-USDT；SWAP/FUTURES 用 instFamily")
-    ap.add_argument("--levels", type=int, default=400, choices=[400, 5000])
-    ap.add_argument("--dest-root", default=str(HERE / "data"))
+    ap.add_argument("--date", default=os.environ.get("DATE", ""), help="UTC date YYYY-MM-DD")
+    ap.add_argument("--inst-type", default=os.environ.get("INST_TYPE", "SWAP"),
+                    choices=["SWAP", "SPOT", "FUTURES"])
+    ap.add_argument("--inst-id", default=os.environ.get("INST_ID", "BTC-USDT"),
+                    help="SPOT 用 BTC-USDT；SWAP/FUTURES 用 instFamily")
+    ap.add_argument("--levels", type=int, default=int(os.environ.get("LEVELS", "400")),
+                    choices=[400, 5000])
+    ap.add_argument("--dest-root", default=os.environ.get("DEST_ROOT", str(HERE / "data")))
     args = ap.parse_args()
+    if not args.date:
+        ap.error("--date or env DATE required")
 
     try:
         d = date.fromisoformat(args.date)

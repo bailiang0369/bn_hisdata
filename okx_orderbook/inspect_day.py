@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
+import sys
 import tarfile
 import time
 from collections import Counter
@@ -19,7 +21,11 @@ from pathlib import Path
 
 import requests
 
-from download_day import API, UA, day_end_ms, get_download_urls
+try:
+    from .download_day import get_download_urls
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from download_day import get_download_urls
 
 HERE = Path(__file__).resolve().parent
 
@@ -30,13 +36,16 @@ def log(msg: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", required=True)
-    ap.add_argument("--inst-type", default="SWAP", choices=["SWAP", "SPOT", "FUTURES"])
-    ap.add_argument("--inst-id", default="BTC-USDT")
-    ap.add_argument("--levels", type=int, default=400)
+    ap.add_argument("--date", default=os.environ.get("DATE", ""))
+    ap.add_argument("--inst-type", default=os.environ.get("INST_TYPE", "SWAP"),
+                    choices=["SWAP", "SPOT", "FUTURES"])
+    ap.add_argument("--inst-id", default=os.environ.get("INST_ID", "BTC-USDT"))
+    ap.add_argument("--levels", type=int, default=int(os.environ.get("LEVELS", "400")))
     ap.add_argument("--n-lines", type=int, default=5, help="每个文件打印前几行原始内容")
-    ap.add_argument("--local", default=None, help="直接探测本地 tar.gz，跳过下载")
+    ap.add_argument("--local", default=os.environ.get("LOCAL", ""), help="直接探测本地 tar.gz")
     args = ap.parse_args()
+    if not args.date:
+        ap.error("--date or env DATE required")
 
     s = requests.Session()
     if args.local:
