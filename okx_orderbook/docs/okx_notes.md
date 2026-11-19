@@ -46,18 +46,23 @@ POST https://www.okx.com/priapi/v5/broker/public/trade-data/download-link
 
 其他模块值（备用）：TRADE_HISTORY=1, CANDLESTICK=2, FUNDING_RATES=3, INTEREST_RATE=11。
 
-## 3. 归档格式（部分为推断，待 `inspect_day.py` 实测确认）
+## 3. 归档格式（2026-11-19 由 `inspect_day.py` 实测确认，kernel `okx-inspect-v4`）
 
-- 文件名：`BTC-USDT-L2orderbook-400lv-YYYY-MM-DD.tar.gz`
-- 内容：NDJSON，每行一个事件（snapshot / update）
-- 推断字段（来自 OKX WebSocket `books` 频道 + 开源项目文档）：
-  `ts`、`action`(snapshot/update)、`bids`/`asks` 数组 `[price, qty, ...]`、
-  `seqId`、`prevSeqId`、`checksum`
-- **时间语义**：归档覆盖前一日 16:00 UTC 到当日 15:59:59 UTC（与币安自然日不同）——
-  对齐时必须验证，不能想当然按自然日 join
+单日文件（2025-10-01 样本）：
 
-**待实测**（`inspect_day.py`）：确认 NDJSON 是扁平逐档还是嵌套数组、字段名精确拼写、
-单日行数、快照频率。
+| 项 | 实测值 |
+|---|---|
+| 压缩大小 | 388 MB（接口标 389 MB） |
+| 解压后 | 2.8 GB NDJSON，单文件 |
+| 行数 | **6,618,837 行/天**（≈10ms 一次事件） |
+| 字段 | 仅 5 个：`instId`, `action`, `ts`, `asks`, `bids`（**无** seqId/checksum） |
+| 档位格式 | `asks`/`bids` = `[[price_str, qty_str, order_count_str], ...]`；**qty=0 表示删除该档** |
+| action | `snapshot` 1440 次（每分钟 1 次）+ `update` 6,617,397 次 |
+| ts 范围 | `1759276800005` ~ `1759363199991`，span **恰好 1440.0 分钟** |
+
+**时间语义修正**：OKX 官方 L2 归档是**自然日 UTC 00:00~23:59**（span 1440 min），
+与币安 `bucket` 自然日一致。开源项目说的"前一日 16:00 起"是它自己 trade 归档的语义，
+不适用于官方 L2 归档。对齐可直接按 `bucket = ts // 60000 * 60000`。
 
 ## 4. 与币安数据结构的对齐（设计原则）
 
