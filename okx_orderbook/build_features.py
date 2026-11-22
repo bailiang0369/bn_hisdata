@@ -28,6 +28,7 @@ ROOT = HERE.parent  # bn_hisdata/
 sys.path.insert(0, str(ROOT / "features"))
 
 from ob_features import build_l1  # noqa: E402
+from ob_rolling import _reindex, build_l2  # noqa: E402
 
 # 档数类列前缀：OKX 与币安不可比，融合时剔除
 COUNT_PREFIXES = ("ob_n_",)
@@ -47,11 +48,20 @@ def main() -> int:
     ap.add_argument("--mid", default=os.environ.get("MID", ""), required=False)
     ap.add_argument("--out", default=os.environ.get("OUT", ""))
     ap.add_argument("--limit-rows", type=int, default=None)
+    ap.add_argument("--l2", action="store_true",
+                    help="追加 ob_rolling 的差分/滚动/z-score 特征，与币安 185 列口径对齐")
     args = ap.parse_args()
     if not args.band or not args.mid or not args.out:
         ap.error("--band / --mid / --out (or env BAND/MID/OUT) required")
 
     df = build_l1(args.band, args.mid, limit_rows=args.limit_rows, bin_mode="bps")
+    if args.l2:
+        # ob_rolling 依赖标准列名（ob_mid/ob_obi_total/...），去掉前缀跑 L2 再加回来
+        raw = df.rename({c: c.removeprefix("okx_") for c in df.columns if c != "close_time"})
+        raw = _reindex(raw)
+        l2 = build_l2(raw)
+        df = l2
+        print(f"[okx_features] L2 expanded: {df.height:,} rows x {df.width} cols")
     # 加 okx_ 前缀；close_time 保持原名以便 join
     ren = {c: f"okx_{c}" for c in df.columns if c != "close_time"}
     df = df.rename(ren)
